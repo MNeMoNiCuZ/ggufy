@@ -145,6 +145,8 @@ pub const flux = Arch{
     .upcast_from_bf16 = &.{
         ".norm.query_norm.scale",
         ".norm.key_norm.scale",
+        ".norm.query_norm.weight",
+        ".norm.key_norm.weight",
     },
 };
 
