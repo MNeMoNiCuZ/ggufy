@@ -245,6 +245,50 @@ pub fn groupClusters(
     };
 }
 
+/// Core NVFP4 dequantization over raw byte slices. Caller owns the returned slice.
+/// weight_bytes: packed nibbles [rows × (cols/2)], even cols in HIGH nibble, odd in LOW.
+/// scale_bytes: F8_E4M3 values in cuBLAS tiled order.
+/// global_scale: scalar multiplier applied to every element.
+pub fn dequantizeFp4Raw(
+    weight_bytes: []const u8,
+    scale_bytes: []const u8,
+    global_scale: f32,
+    rows: usize,
+    cols: usize,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+
+    const num_scale_cols = cols / 16;
+    const n_col_blocks = (num_scale_cols + 3) / 4;
+
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            // Even-indexed elements are packed in the HIGH nibble, odd in the LOW nibble.
+            const nibble: u4 = if (col % 2 == 0)
+                @intCast(weight_bytes[row * (cols / 2) + col / 2] >> 4)
+            else
+                @intCast(weight_bytes[row * (cols / 2) + col / 2] & 0xF);
+
+            const fp4_val = DataTransform.Quantizer.lut_fp4_e2m1[nibble];
+
+            // cuBLAS tiled block-scale layout (mirrors to_blocked() in the Python reference).
+            const scale_col = col / 16;
+            const r0 = row / 128;
+            const r1 = row % 128;
+            const c0 = scale_col / 4;
+            const c1 = scale_col % 4;
+            const scale_idx = (r0 * n_col_blocks + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
+
+            const block_scale = DataTransform.Quantizer.lut_e4m3[scale_bytes[scale_idx]];
+            out[row * cols + col] = fp4_val * block_scale * global_scale;
+        }
+    }
+
+    return out;
+}
+
 /// Dequantize an NVFP4 cluster to a flat F32 slice of [rows * cols] elements.
 /// Caller owns the returned slice.
 pub fn dequantizeFp4Cluster(
@@ -272,39 +316,7 @@ pub fn dequantizeFp4Cluster(
     defer allocator.free(gs_buf);
     const global_scale: f32 = @bitCast(std.mem.readInt(u32, gs_buf[0..4], .little));
 
-    const rows = cluster.rows;
-    const cols = cluster.cols;
-    const out = try allocator.alloc(f32, rows * cols);
-    errdefer allocator.free(out);
-
-    const num_scale_cols = cols / 16;
-    const n_col_blocks = (num_scale_cols + 3) / 4;
-
-    for (0..rows) |row| {
-        for (0..cols) |col| {
-            const byte_idx = row * (cols / 2) + col / 2;
-            // Even-indexed elements are packed in the HIGH nibble, odd in the LOW nibble.
-            const nibble: u4 = if (col % 2 == 0)
-                @intCast(weight_bytes[byte_idx] >> 4)
-            else
-                @intCast(weight_bytes[byte_idx] & 0xF);
-
-            const fp4_val = DataTransform.Quantizer.lut_fp4_e2m1[nibble];
-
-            // cuBLAS tiled block-scale layout (mirrors to_blocked() in the Python reference).
-            const scale_col = col / 16;
-            const r0 = row / 128;
-            const r1 = row % 128;
-            const c0 = scale_col / 4;
-            const c1 = scale_col % 4;
-            const scale_idx = (r0 * n_col_blocks + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
-
-            const block_scale = DataTransform.Quantizer.lut_e4m3[scale_bytes[scale_idx]];
-            out[row * cols + col] = fp4_val * block_scale * global_scale;
-        }
-    }
-
-    return out;
+    return dequantizeFp4Raw(weight_bytes, scale_bytes, global_scale, cluster.rows, cluster.cols, allocator);
 }
 
 /// Dequantize an FP8 (ComfyUI) cluster to F32: f8_weight × scalar_scale.
@@ -564,6 +576,19 @@ pub fn collapseModelTensors(
 
 const testing = std.testing;
 
+const fixture_dir = "src/test_fixtures";
+
+fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ fixture_dir, name });
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer file.close();
+    return try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+}
+
 test "parseComfyQuantScheme: identifies all known formats" {
     try testing.expectEqual(.nvfp4,        parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
     try testing.expectEqual(.float8_e4m3fn, parseComfyQuantScheme("{\"format\": \"float8_e4m3fn\"}"));
@@ -670,4 +695,44 @@ test "MXFP8 cluster dequant: inline spot-check with E8M0 scale and F8 LUT" {
     // scale_byte=128 → 2.0; product = 2.0
     const scale = DataTransform.Quantizer.e8m0_to_f32(128);
     try testing.expectApproxEqAbs(@as(f32, 2.0), f8_val * scale, 1e-6);
+}
+
+test "NVFP4 dequant: fixture from real ComfyUI model (128×256 slice)" {
+    // Validates dequantizeFp4Raw against data extracted from
+    // ernieImageQuants_turboNVFP4.safetensors by gen_nvfp4_fixtures.py.
+    // Covers the full r1 range (0..127) and all four cuBLAS column-block
+    // groups (n_col_blocks=4 for COLS=256), using scale indices 0..2047.
+    const allocator = std.testing.allocator;
+
+    const weight_bytes = (try loadFixture(allocator, "nvfp4_weight.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(weight_bytes);
+    const scale_bytes = (try loadFixture(allocator, "nvfp4_weight_scale.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(scale_bytes);
+    const gs_bytes = (try loadFixture(allocator, "nvfp4_weight_scale_2.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(gs_bytes);
+    const expected_bytes = (try loadFixture(allocator, "nvfp4_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const rows: usize = 128;
+    const cols: usize = 256;
+    try testing.expectEqual(rows * (cols / 2), weight_bytes.len);
+    try testing.expectEqual(@as(usize, 2048), scale_bytes.len);
+
+    const global_scale: f32 = @bitCast(std.mem.readInt(u32, gs_bytes[0..4], .little));
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try testing.expectEqual(rows * cols, expected.len);
+
+    const got = try dequantizeFp4Raw(weight_bytes, scale_bytes, global_scale, rows, cols, allocator);
+    defer allocator.free(got);
+
+    var mismatches: usize = 0;
+    for (got, expected, 0..) |g, e, i| {
+        if (@abs(g - e) > 1e-6) {
+            if (mismatches < 8) {
+                std.debug.print("  NVFP4[{}]: got={d:.8} expected={d:.8}\n", .{ i, g, e });
+            }
+            mismatches += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mismatches);
 }
