@@ -21,7 +21,7 @@ pub const ThreadPool = struct {
         allocator: std.mem.Allocator,
         n_jobs: usize,
     }) !void {
-        pool.threads = .{ .len = opts.n_jobs };
+        pool.threads = .{ .len = @min(opts.n_jobs, max_concurrent) };
     }
 
     pub fn deinit(pool: *ThreadPool) void {

@@ -54,12 +54,25 @@ pub const GroupResult = struct {
 };
 
 /// Parse the JSON payload of a comfy_quant blob to identify the quantization scheme.
+/// Reads the "format" key; returns .unknown on any parse error or unrecognised value.
 pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
-    if (std.mem.indexOf(u8, data, "nvfp4") != null) return .nvfp4;
-    // Check mxfp8 before mxfp4 and before float8_e4m3fn to avoid false matches.
-    if (std.mem.indexOf(u8, data, "mxfp8") != null) return .mxfp8_e4m3fn;
-    if (std.mem.indexOf(u8, data, "mxfp4") != null) return .mxfp4;
-    if (std.mem.indexOf(u8, data, "float8_e4m3fn") != null) return .float8_e4m3fn;
+    var fba_buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), data, .{}) catch return .unknown;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return .unknown,
+    };
+    const fmt_val = obj.get("format") orelse return .unknown;
+    const fmt_str = switch (fmt_val) {
+        .string => |s| s,
+        else => return .unknown,
+    };
+    if (std.mem.eql(u8, fmt_str, "nvfp4")) return .nvfp4;
+    if (std.mem.eql(u8, fmt_str, "mxfp8_e4m3fn") or std.mem.eql(u8, fmt_str, "mxfp8")) return .mxfp8_e4m3fn;
+    if (std.mem.eql(u8, fmt_str, "mxfp4")) return .mxfp4;
+    if (std.mem.eql(u8, fmt_str, "float8_e4m3fn")) return .float8_e4m3fn;
     return .unknown;
 }
 
@@ -317,6 +330,7 @@ pub fn dequantizeFp4Cluster(
     pool: *thread_pool_mod.ThreadPool,
 ) ![]f32 {
     if (cluster.cols % 64 != 0) return error.InvalidClusterShape;
+    if (cluster.rows % 128 != 0) return error.InvalidClusterShape;
 
     const w_file = try source.openFileForTensor(cluster.weight.name);
     const weight_bytes = try allocator.alloc(u8, cluster.weight.size);
@@ -720,20 +734,27 @@ fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
 }
 
 test "parseComfyQuantScheme: identifies all known formats" {
-    try testing.expectEqual(.nvfp4,        parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
+    try testing.expectEqual(.nvfp4,         parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
     try testing.expectEqual(.float8_e4m3fn, parseComfyQuantScheme("{\"format\": \"float8_e4m3fn\"}"));
-    try testing.expectEqual(.mxfp4,        parseComfyQuantScheme("{\"format\": \"mxfp4\"}"));
-    try testing.expectEqual(.mxfp8_e4m3fn, parseComfyQuantScheme("{\"format\": \"mxfp8_e4m3fn\"}"));
-    try testing.expectEqual(.mxfp8_e4m3fn, parseComfyQuantScheme("{\"format\": \"mxfp8\"}"));
-    try testing.expectEqual(.unknown,      parseComfyQuantScheme("{\"format\": \"bf16\"}"));
-    try testing.expectEqual(.unknown,      parseComfyQuantScheme("{}"));
+    try testing.expectEqual(.mxfp4,         parseComfyQuantScheme("{\"format\": \"mxfp4\"}"));
+    try testing.expectEqual(.mxfp8_e4m3fn,  parseComfyQuantScheme("{\"format\": \"mxfp8_e4m3fn\"}"));
+    try testing.expectEqual(.mxfp8_e4m3fn,  parseComfyQuantScheme("{\"format\": \"mxfp8\"}"));
+    try testing.expectEqual(.unknown,       parseComfyQuantScheme("{\"format\": \"bf16\"}"));
+    try testing.expectEqual(.unknown,       parseComfyQuantScheme("{}"));
+    try testing.expectEqual(.unknown,       parseComfyQuantScheme("not json"));
 }
 
-test "parseComfyQuantScheme: mxfp8 takes priority over float8_e4m3fn" {
-    // A blob that mentions both strings — mxfp8 wins because it's checked first.
+test "parseComfyQuantScheme: ignores non-format keys containing scheme names" {
+    // Substring search would have returned .float8_e4m3fn here; key-based parsing returns the
+    // correct scheme from the "format" field regardless of other fields.
     try testing.expectEqual(
         .mxfp8_e4m3fn,
         parseComfyQuantScheme("{\"format\": \"mxfp8_e4m3fn\", \"note\": \"uses float8_e4m3fn elements\"}"),
+    );
+    // A "format" key takes precedence; stray mentions of other scheme names elsewhere are ignored.
+    try testing.expectEqual(
+        .nvfp4,
+        parseComfyQuantScheme("{\"format\": \"nvfp4\", \"base\": \"mxfp4\"}"),
     );
 }
 
