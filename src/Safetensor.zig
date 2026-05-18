@@ -910,7 +910,11 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, c
                 for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
             }
             const weight_bytes: u64 = n_rows * n_cols;  // 1 byte per F8_E4M3 element
-                const scale_bytes:  u64 = n_rows * ((n_cols + 31) / 32);  // U8 E8M0, 1 byte each
+                // cuBLAS blocked scale: padded to [n_row_blocks*128, n_col_blocks*4]
+                const n_scale_cols_hdr: u64 = (n_cols + 31) / 32;
+                const n_row_blocks_hdr: u64 = (n_rows + 127) / 128;
+                const n_col_blocks_hdr: u64 = (n_scale_cols_hdr + 3) / 4;
+                const scale_bytes:  u64 = n_row_blocks_hdr * 128 * n_col_blocks_hdr * 4;
                 const comfy_json = Convert.mxfp8_comfy_json;
 
             const scale_start = t.offset + weight_bytes;
@@ -935,14 +939,17 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, c
                 try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
                 try header_obj.put(self.arena_alloc,t.name, .{ .object = obj });
             }
-            // weight_scale: dtype U8 E8M0, shape [n_rows, n_cols/32]
+            // weight_scale: dtype U8 E8M0, cuBLAS blocked shape [n_row_blocks*128, n_col_blocks*4]
                 {
                 const sname = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale", .{base});
+                const n_scale_cols: u64 = (n_cols + 31) / 32;
+                const n_row_blocks: u64 = (n_rows + 127) / 128;
+                const n_col_blocks: u64 = (n_scale_cols + 3) / 4;
                 var obj = std.json.ObjectMap.empty;
                 try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
                 var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_rows) });
-                try shape.append(.{ .integer = @intCast((n_cols + 31) / 32) });
+                try shape.append(.{ .integer = @intCast(n_row_blocks * 128) });
+                try shape.append(.{ .integer = @intCast(n_col_blocks * 4) });
                 try obj.put(self.arena_alloc,"shape", .{ .array = shape });
                 var offsets = std.json.Array.init(self.arena_alloc);
                 try offsets.append(.{ .integer = @intCast(scale_start) });
@@ -1266,11 +1273,18 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, c
                 defer self.allocator.free(cluster.weight);
                 defer self.allocator.free(cluster.scale);
 
+                // Apply cuBLAS blocking to scales before writing
+                const n_scale_cols: usize = @intCast((n_cols + 31) / 32);
+                const blocked_scale = try DataTransform.Quantizer.toBlockedMxfp8(
+                    self.allocator, cluster.scale, @intCast(n_rows), n_scale_cols,
+                );
+                defer self.allocator.free(blocked_scale);
+
                 std.log.info("Writing MXFP8 cluster {s} [{}, {}] from {s}", .{
                     t.name, n_rows, n_cols, source_tensor.type,
                 });
                 try (&writer.interface).writeAll(cluster.weight);
-                try (&writer.interface).writeAll(cluster.scale);
+                try (&writer.interface).writeAll(blocked_scale);
                 try (&writer.interface).writeAll(Convert.mxfp8_comfy_json);
                 callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, "MXFP8_E4M3", @intCast(n_elements));
                 count += 1;

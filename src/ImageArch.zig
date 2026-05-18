@@ -22,6 +22,8 @@ pub const Arch = struct {
     sensitivities: []const u8 = "",
     /// Keys that should be upcast from bf16 to fp32 (start with a dot for end match)
     upcast_from_bf16: []const []const u8 = &.{},
+    /// Keys that must pass through as-is in NVFP4 output (ComfyUI reads their shape[1] for arch detection)
+    keys_nvfp4_passthrough: []const []const u8 = &.{},
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -77,6 +79,14 @@ pub const Arch = struct {
     /// Check if any of the given tensor names are banned (returns bool)
     pub fn hasBannedKeys(self: Arch, tensor_names: []const []const u8) bool {
         return self.findBannedKey(tensor_names) != null;
+    }
+
+    /// Check if a key must pass through unquantized in NVFP4 output for ComfyUI compat
+    pub fn isNvfp4Passthrough(self: Arch, key: []const u8) bool {
+        for (self.keys_nvfp4_passthrough) |pattern| {
+            if (std.mem.indexOf(u8, key, pattern) != null) return true;
+        }
+        return false;
     }
 
     /// Check if the key should be upcast from bf16
@@ -283,6 +293,12 @@ pub const lumina2 = Arch{
     .upcast_from_bf16 = &.{
         "cap_pad_token",
         "x_pad_token",
+    },
+    // ComfyUI infers cap_feat_dim from cap_embedder.1.weight.shape[1]. NVFP4 nibble-packing
+    // halves that dimension, causing a shape mismatch when loading. Keep as BF16 so ComfyUI
+    // reads the correct dimension.
+    .keys_nvfp4_passthrough = &.{
+        "cap_embedder.1.weight",
     },
 };
 

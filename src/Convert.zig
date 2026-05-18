@@ -14,7 +14,7 @@ const DataTransform = @import("DataTransform.zig");
 pub const mxfp4_comfy_json  = "{\"format\":\"mxfp4\"}";
 pub const mxfp8_comfy_json  = "{\"format\":\"mxfp8\"}";
 pub const fp8_comfy_json    = "{\"format\": \"float8_e4m3fn\"}";
-pub const nvfp4_comfy_json  = "{\"format\":\"nvfp4\"}";
+pub const nvfp4_comfy_json  = "{\"format\": \"nvfp4\"}";
 
 // ============================================================================
 // Public API
@@ -652,7 +652,11 @@ fn assignTensorType(
             if (n_cols >= 32) {
                 const n_rows: u64 = num_elements / n_cols;
                 const weight_bytes: u64 = n_rows * n_cols;  // 1 byte per F8_E4M3 element
-                const scale_bytes:  u64 = n_rows * ((n_cols + 31) / 32);
+                // Scales stored in cuBLAS blocked layout: pad to [n_row_blocks*128, n_col_blocks*4]
+                const n_scale_cols: u64 = (n_cols + 31) / 32;
+                const n_row_blocks: u64 = (n_rows + 127) / 128;
+                const n_col_blocks: u64 = (n_scale_cols + 3) / 4;
+                const scale_bytes:  u64 = n_row_blocks * 128 * n_col_blocks * 4;
                 const comfy_bytes:  u64 = mxfp8_comfy_json.len;
                 t.type = "MXFP8_E4M3";
                 t.size = weight_bytes + scale_bytes + comfy_bytes;
@@ -665,6 +669,7 @@ fn assignTensorType(
     // NVFP4 safetensors output: ComfyUI cluster (U8 weight + F8_E4M3 scales + F32 global + comfy_quant).
     // Requires cols % 64 == 0 and rows % 128 == 0 (cuBLAS tiling constraint).
     if (ttype == .NVFP4 and opts.filetype == .safetensors and t.dims.len >= 1) {
+        if (arch.isNvfp4Passthrough(t.name)) return nearestCompatibleType(t, opts, num_elements);
         if (std.mem.endsWith(u8, t.name, ".weight")) {
             const n_cols: u64 = t.dims[t.dims.len - 1];
             if (n_cols >= 64 and n_cols % 64 == 0) {

@@ -145,6 +145,59 @@ b4 = make_gguf_mxfp4_block(124, [7] * 16, [15] * 16)
 blocks += b4
 expected_vals += decode_gguf_mxfp4_block(b4)
 
+
+# ---------------------------------------------------------------------------
+# MXFP8 cuBLAS scale blocking (to_blocked)
+#
+# Three test cases exercise the blocking for different padding scenarios:
+#   Case 1: [128, 128] weight → scales [128, 4]  — exact fit, no padding
+#   Case 2: [3840,  64] weight → scales [3840, 2] — n_scale_cols needs col padding
+#   Case 3: [ 200,  96] weight → scales [200,  3] — both dims need padding
+#
+# Each case saves:
+#   mxfp8_blocking_input_N.u8    — row-major input scales (n_rows × n_scale_cols)
+#   mxfp8_blocking_expected_N.u8 — expected cuBLAS-tiled output
+# ---------------------------------------------------------------------------
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+def to_blocked(input_matrix):
+    """Apply cuBLAS MXFP8 scale blocking (padded, swizzled output)."""
+    rows, cols = input_matrix.shape
+    n_row_blocks = ceil_div(rows, 128)
+    n_col_blocks = ceil_div(cols, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+    padded = np.zeros((padded_rows, padded_cols), dtype=input_matrix.dtype)
+    padded[:rows, :cols] = input_matrix
+    blocks = padded.reshape(n_row_blocks, 128, n_col_blocks, 4).transpose(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(0, 2, 1, 3).reshape(-1, 32, 16)
+    return rearranged.reshape(padded_rows, padded_cols)
+
+blocking_cases = [
+    (128, 128, 1),  # exact fit
+    (3840, 64,  2),  # col padding needed
+    (200, 96,   3),  # both dims need padding
+]
+
+rng = np.random.default_rng(0xDEADBEEF)
+for (weight_rows, weight_cols, case_num) in blocking_cases:
+    n_scale_cols = (weight_cols + 31) // 32
+    scales = rng.integers(0, 255, size=(weight_rows, n_scale_cols), dtype=np.uint8)
+    blocked = to_blocked(scales)
+    scales.tobytes()  # row-major
+    inp_path = os.path.join(OUT_DIR, f"mxfp8_blocking_input_{case_num}.u8")
+    exp_path = os.path.join(OUT_DIR, f"mxfp8_blocking_expected_{case_num}.u8")
+    with open(inp_path, "wb") as f:
+        f.write(scales.tobytes())
+    with open(exp_path, "wb") as f:
+        f.write(blocked.tobytes())
+    print(f"MXFP8 blocking case {case_num}: weight [{weight_rows},{weight_cols}] "
+          f"scales [{weight_rows},{n_scale_cols}] -> blocked [{blocked.shape[0]},{blocked.shape[1]}] "
+          f"({scales.nbytes} -> {blocked.nbytes} bytes)")
+
+
 with open(os.path.join(OUT_DIR, "mxfp4_gguf_test_blocks.bin"), "wb") as f:
     f.write(blocks)
 
