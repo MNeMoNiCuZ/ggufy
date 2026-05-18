@@ -5,6 +5,8 @@ pub const LoadState = enum(u8) { idle, loading, done, err };
 pub const ConvertState = enum(u8) { idle, converting, done, err };
 
 pub const State = struct {
+    io: std.Io = undefined,
+
     // File load
     load_state: std.atomic.Value(LoadState) = .init(.idle),
     dropping: bool = false,

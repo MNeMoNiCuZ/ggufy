@@ -117,7 +117,7 @@ pub fn link(
     optimize: std.builtin.OptimizeMode,
 ) void {
     const lib = buildLib(b, target, optimize);
-    exe.linkLibrary(lib);
+    exe.root_module.linkLibrary(lib);
 }
 
 /// Build and return the static GGML library.
@@ -133,6 +133,7 @@ pub fn buildLib(
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libcpp = true,
         }),
     });
 
@@ -153,9 +154,9 @@ fn addSources(
     const is_arm = arch == .aarch64;
 
     // Include paths
-    lib.addIncludePath(b.path(ggml_root ++ "/include"));
-    lib.addIncludePath(b.path(ggml_root ++ "/src"));
-    lib.addIncludePath(b.path(ggml_root ++ "/src/ggml-cpu"));
+    lib.root_module.addIncludePath(b.path(ggml_root ++ "/include"));
+    lib.root_module.addIncludePath(b.path(ggml_root ++ "/src"));
+    lib.root_module.addIncludePath(b.path(ggml_root ++ "/src/ggml-cpu"));
 
     // Platform macros — use defineCMacro rather than -D flags to avoid
     // the "macro redefined" warning from Zig's built-in definitions.
@@ -179,29 +180,28 @@ fn addSources(
 
     // All C++ files need libc++ (satisfies exception/RTTI runtime symbols,
     // including the SEH glue on Windows that was causing link errors).
-    lib.linkLibCpp();
 
     // ── Group 1: ggml-base (no SIMD) ────────────────────────────────────────
-    for (base_c_sources)   |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
-    for (base_cpp_sources) |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+    for (base_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
+    for (base_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
 
     // ── Group 2: backend registry (C++ exceptions required, no SIMD) ────────
-    for (reg_cpp_sources)  |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+    for (reg_cpp_sources)  |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
 
     // ── Group 3: CPU backend (SIMD flags on x86) ────────────────────────────
     const c_flags_cpu   = if (is_x86) &x86_c_flags   else &base_c_flags;
     const cpp_flags_cpu = if (is_x86) &x86_cpp_flags  else &base_cpp_flags;
 
-    for (cpu_c_sources)   |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = c_flags_cpu });
-    for (cpu_cpp_sources) |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = cpp_flags_cpu });
+    for (cpu_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = c_flags_cpu });
+    for (cpu_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = cpp_flags_cpu });
 
     // Arch-specific sources
     if (is_x86) {
-        for (cpu_x86_c_sources)   |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &x86_c_flags });
-        for (cpu_x86_cpp_sources) |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &x86_cpp_flags });
+        for (cpu_x86_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &x86_c_flags });
+        for (cpu_x86_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &x86_cpp_flags });
     } else if (is_arm) {
-        for (cpu_arm_c_sources)   |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
-        for (cpu_arm_cpp_sources) |f| lib.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+        for (cpu_arm_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
+        for (cpu_arm_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
     }
 }
 

@@ -25,7 +25,7 @@
     .fingerprint = 0x3853cf8946957bc, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,12 +33,12 @@
     // internet connectivity.
     .dependencies = .{
         .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
-            .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui#c340b88053280e1cf19890e56c797664f9bf7ca2",
-            .hash = "dvui-0.4.0-dev-AQFJmTXU3wBJ2wCYyH4UeUWkMBSJbY7y6Ouc11_Gkls1",
+            .url = "git+https://github.com/david-vanderson/dvui?ref=main#5577c507f746018b7ec29957e62a4b86b5047b9d",
+            .hash = "dvui-0.5.0-dev-AQFJmeTy9QDL3m_yewh656aqxib46ngC37A_goLmAENy",
         },
     },
     .paths = .{

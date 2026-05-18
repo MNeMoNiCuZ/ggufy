@@ -22,6 +22,8 @@ pub const Arch = struct {
     sensitivities: []const u8 = "",
     /// Keys that should be upcast from bf16 to fp32 (start with a dot for end match)
     upcast_from_bf16: []const []const u8 = &.{},
+    /// Keys that must pass through as-is in NVFP4 output (ComfyUI reads their shape[1] for arch detection)
+    keys_nvfp4_passthrough: []const []const u8 = &.{},
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -77,6 +79,14 @@ pub const Arch = struct {
     /// Check if any of the given tensor names are banned (returns bool)
     pub fn hasBannedKeys(self: Arch, tensor_names: []const []const u8) bool {
         return self.findBannedKey(tensor_names) != null;
+    }
+
+    /// Check if a key must pass through unquantized in NVFP4 output for ComfyUI compat
+    pub fn isNvfp4Passthrough(self: Arch, key: []const u8) bool {
+        for (self.keys_nvfp4_passthrough) |pattern| {
+            if (std.mem.indexOf(u8, key, pattern) != null) return true;
+        }
+        return false;
     }
 
     /// Check if the key should be upcast from bf16
@@ -148,6 +158,16 @@ pub const flux = Arch{
         ".norm.query_norm.weight",
         ".norm.key_norm.weight",
     },
+    // ComfyUI infers in_channels from img_in.weight.shape[1], context_in_dim from
+    // txt_in.weight.shape[1], and vec_in_dim from vector_in.in_layer.weight.shape[1].
+    // NVFP4 nibble-packing halves the column count, so ComfyUI detects half the true
+    // dimension and then clips the dequantized weight, causing shape mismatches at runtime.
+    // Keep these as BF16 so ComfyUI reads the correct dimensions.
+    .keys_nvfp4_passthrough = &.{
+        "img_in.weight",
+        "txt_in.weight",
+        "vector_in.in_layer.weight",
+    },
 };
 
 pub const sd3 = Arch{
@@ -158,6 +178,12 @@ pub const sd3 = Arch{
     },
     .keys_banned = &.{"transformer_blocks.0.attn.add_q_proj.weight"},
     .threshhold = null,
+    // ComfyUI infers adm_in_channels from y_embedder.mlp.0.weight.shape[1] and
+    // context_dim from context_embedder.weight.shape[1]; NVFP4 packing halves both.
+    .keys_nvfp4_passthrough = &.{
+        "y_embedder.mlp.0.weight",
+        "context_embedder.weight",
+    },
 };
 
 pub const aura = Arch{
@@ -251,6 +277,10 @@ pub const sdxl = Arch{
     },
     .threshhold = null,
     .sensitivities = @embedFile("sensitivities/sdxl.json"),
+    // ComfyUI infers adm_in_channels from label_emb.0.0.weight.shape[1]; NVFP4 packing halves it.
+    .keys_nvfp4_passthrough = &.{
+        "label_emb.0.0.weight",
+    },
 };
 
 pub const sd1 = Arch{
@@ -270,6 +300,11 @@ pub const sd1 = Arch{
     },
     .threshhold = null,
     .sensitivities = @embedFile("sensitivities/sd1.5.json"),
+    // ComfyUI infers adm_in_channels from label_emb.0.0.weight.shape[1] on class-conditional
+    // SD1 variants; NVFP4 packing halves it.
+    .keys_nvfp4_passthrough = &.{
+        "label_emb.0.0.weight",
+    },
 };
 
 pub const lumina2 = Arch{
@@ -285,6 +320,12 @@ pub const lumina2 = Arch{
     .upcast_from_bf16 = &.{
         "cap_pad_token",
         "x_pad_token",
+    },
+    // ComfyUI infers cap_feat_dim from cap_embedder.1.weight.shape[1]. NVFP4 nibble-packing
+    // halves that dimension, causing a shape mismatch when loading. Keep as BF16 so ComfyUI
+    // reads the correct dimension.
+    .keys_nvfp4_passthrough = &.{
+        "cap_embedder.1.weight",
     },
 };
 
@@ -305,6 +346,10 @@ pub const qwen = Arch{
         ".norm_q.weight",
         ".norm_added_k.weight",
         ".norm_added_q.weight",
+    },
+    // ComfyUI infers in_channels from img_in.weight.shape[1]; NVFP4 packing halves it.
+    .keys_nvfp4_passthrough = &.{
+        "img_in.weight",
     },
 };
 

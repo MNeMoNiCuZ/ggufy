@@ -2,6 +2,7 @@ const std = @import("std");
 const gguf = @import("Gguf.zig");
 const types = @import("types.zig");
 const ggml = @import("ggml.h");
+const thread_pool_mod = @import("ThreadPool.zig");
 
 pub const Quantizer = struct {
     // Main entry point: Source -> F32 -> Dest
@@ -11,7 +12,7 @@ pub const Quantizer = struct {
         src_type: types.DataType,
         dst_type: types.DataType,
         element_count: u64,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
     ) ![]u8 {
         // Optimization: Direct copy if types match
         if (src_type.equivalentType(@tagName(dst_type))) {
@@ -41,7 +42,7 @@ pub const Quantizer = struct {
         input_bytes: []const u8,
         output_f32: []f32,
         src_type: types.DataType,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
     ) !void {
         switch (src_type) {
             .F8_E4M3 => {
@@ -53,6 +54,17 @@ pub const Quantizer = struct {
                 if (input_bytes.len != output_f32.len)
                     return error.InputSizeMismatch;
                 try dequantizeSimple(input_bytes, output_f32, pool, .F8_E5M2);
+            },
+            .F4_E2M1, .MXFP4 => {
+                if (input_bytes.len * 2 != output_f32.len)
+                    return error.InputSizeMismatch;
+                dequantizeFP4(input_bytes, output_f32, pool);
+            },
+            .mxfp4 => {
+                // GGUF block format: [scale: E8M0 u8][qs[0..15]: u8×16] per 32 elements
+                const n_blocks = input_bytes.len / 17;
+                if (n_blocks * 32 != output_f32.len) return error.InputSizeMismatch;
+                dequantizeMXFP4Gguf(input_bytes, output_f32, pool);
             },
             .BF16, .bf16 => {
                 if (input_bytes.len / 2 != output_f32.len) return error.InputSizeMismatch;
@@ -81,7 +93,7 @@ pub const Quantizer = struct {
         input_f32: []const f32,
         output_bytes: []u8,
         dst_type: types.DataType,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
     ) !void {
         switch (dst_type) {
             .f32, .F32 => {
@@ -101,9 +113,15 @@ pub const Quantizer = struct {
                     return error.OutputBufferSizeMismatch;
                 try convertTypeSimple(input_f32, output_bytes, pool, dst_type);
             },
+            .F4_E2M1, .MXFP4 => {
+                if (output_bytes.len * 2 != input_f32.len)
+                    return error.OutputBufferSizeMismatch;
+                quantizeFP4(input_f32, output_bytes, pool);
+            },
             .q8_0, .q5_0, .q4_0,
             .q5_1, .q4_1,
-            .q6_k, .q5_k, .q4_k, .q3_k, .q2_k => {
+            .q6_k, .q5_k, .q4_k, .q3_k, .q2_k,
+            .mxfp4 => {
                 const gguf_type = try gguf.GgmlType.fromString(@tagName(dst_type));
                 const block_elements = gguf_type.getBlockSize();
                 const block_size = gguf_type.getBytesPerBlock();
@@ -124,7 +142,7 @@ pub const Quantizer = struct {
     fn convertTypeGguf(
         input_f32: []const f32,
         output_bytes: []u8,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
         q_type: gguf.GgmlType,
         block_elements: u64,
         block_size: u64,
@@ -140,7 +158,7 @@ pub const Quantizer = struct {
         const blocks_per_thread = @divTrunc(block_count, threads_u64);
         const leftover = block_count - (blocks_per_thread * threads_u64);
 
-        var wg: std.Thread.WaitGroup = .{};
+        var wg: thread_pool_mod.WaitGroup = .{};
 
         var i: u64 = 0;
         while (i < threads_u64) : (i += 1) {
@@ -178,7 +196,7 @@ pub const Quantizer = struct {
     fn convertTypeSimple(
         input_f32: []const f32,
         output_bytes: []u8,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
         dst_type: types.DataType,
     ) !void {
         const element_count = input_f32.len;
@@ -186,7 +204,7 @@ pub const Quantizer = struct {
         const elems_per_thread = element_count / threads_count;
         const leftover = element_count - (elems_per_thread * threads_count);
 
-        var wg: std.Thread.WaitGroup = .{};
+        var wg: thread_pool_mod.WaitGroup = .{};
 
         var i: usize = 0;
         while (i < threads_count) : (i += 1) {
@@ -349,7 +367,7 @@ pub const Quantizer = struct {
     fn dequantizeSimple(
         input_bytes: []const u8,
         output_f32: []f32,
-        pool: *std.Thread.Pool,
+        pool: *thread_pool_mod.ThreadPool,
         src_type: types.DataType,
     ) !void {
         const element_count = output_f32.len;
@@ -357,7 +375,7 @@ pub const Quantizer = struct {
         const elems_per_thread = element_count / threads_count;
         const leftover = element_count - (elems_per_thread * threads_count);
 
-        var wg: std.Thread.WaitGroup = .{};
+        var wg: thread_pool_mod.WaitGroup = .{};
 
         var i: usize = 0;
         while (i < threads_count) : (i += 1) {
@@ -562,6 +580,360 @@ pub const Quantizer = struct {
         return (from_sign << 7) | result;
     }
 
+    // -------------------------------------------------------------------------
+    // E8M0: 8-bit unsigned exponent-only scale used in MX formats.
+    // Value = 2^(x - 127); x=0 maps to the subnormal 2^-127; x=255 is NaN.
+    // -------------------------------------------------------------------------
+
+    pub fn e8m0_to_f32(x: u8) f32 {
+        if (x == 0) return @bitCast(@as(u32, 0x0040_0000)); // 2^-127 as f32 subnormal
+        if (x == 255) return std.math.nan(f32); // E8M0: x=255 is NaN
+        return @bitCast(@as(u32, x) << 23);
+    }
+
+    /// Encode an f32 value to E8M0 (8-bit exponent-only) format.
+    /// Extracts the f32 biased exponent (range 0-255) and returns it directly.
+    /// Special cases: NaN/Inf → 255, zero/subnormal → 0.
+    pub fn f32_to_e8m0(x: f32) u8 {
+        const bits: u32 = @bitCast(x);
+        const abs_bits: u32 = bits & 0x7FFF_FFFF;
+
+        // Zero → 0
+        if (abs_bits == 0) return 0;
+        // Extract biased exponent (bits 23-30)
+        const biased_exp: u32 = (abs_bits >> 23) & 0xFF;
+
+        // NaN or Inf (exp == 255) → 255
+        // Subnormal (exp == 0) → 0
+        // Normal → biased_exp
+        if (biased_exp == 0) return 0;
+        if (biased_exp == 255) return 255;
+
+        return @truncate(biased_exp);
+    }
+
+    // -------------------------------------------------------------------------
+    // FP4 / E2M1: 1 sign | 2 exp (bias=1) | 1 mantissa, 2 nibbles/byte.
+    // Positive values: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+    // Used as the element type for FP4, NV FP4, and MX FP4; block-level scaling
+    // (if any) is stored externally and is not part of this element encoding.
+    // Packing: element[2i] in low nibble, element[2i+1] in high nibble.
+    // -------------------------------------------------------------------------
+
+    pub const lut_fp4_e2m1: [16]f32 = blk: {
+        var t: [16]f32 = undefined;
+        var i: u32 = 0;
+        while (i < 16) : (i += 1) t[i] = fp4_e2m1_to_f32(@intCast(i));
+        break :blk t;
+    };
+
+    pub fn fp4_e2m1_to_f32(nibble: u4) f32 {
+        const positives = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+        const sign: f32 = if ((nibble >> 3) != 0) -1.0 else 1.0;
+        return sign * positives[nibble & 0x7];
+    }
+
+    pub fn f32_to_fp4_e2m1(x: f32) u4 {
+        const bits: u32 = @bitCast(x);
+        const sign: u4 = @truncate(bits >> 31);
+        const abs_bits: u32 = bits & 0x7FFF_FFFF;
+        // NaN/Inf → saturate to max magnitude (6.0)
+        if (abs_bits >= 0x7F80_0000) return (sign << 3) | 0x7;
+        const abs: f32 = @bitCast(abs_bits);
+        // Round-to-nearest-even over the 8 representable magnitudes.
+        // At midpoints, even code (0,2,4,6) wins: use <= for even-lower, < for odd-lower.
+        const code: u4 = if (abs <= 0.25) 0
+            else if (abs < 0.75) 1
+            else if (abs <= 1.25) 2
+            else if (abs < 1.75) 3
+            else if (abs <= 2.5) 4
+            else if (abs < 3.5) 5
+            else if (abs <= 5.0) 6
+            else 7;
+        return (sign << 3) | code;
+    }
+
+    fn dequantizeFP4(input_bytes: []const u8, output_f32: []f32, pool: *thread_pool_mod.ThreadPool) void {
+        const element_count = output_f32.len;
+        if (element_count == 0) return;
+        const threads_count = @min(pool.threads.len, element_count);
+        // Round chunk size up to even so byte boundaries don't straddle threads.
+        const raw_per = element_count / threads_count;
+        const elems_per_thread = @max(2, (raw_per + 1) & ~@as(usize, 1));
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var start: usize = 0;
+        while (start < element_count) : (start += elems_per_thread) {
+            const end = @min(start + elems_per_thread, element_count);
+            pool.spawnWg(&wg, processDequantizeFP4, .{ input_bytes, output_f32, start, end });
+        }
+        wg.wait();
+    }
+
+    fn processDequantizeFP4(input_bytes: []const u8, output_f32: []f32, start: usize, end: usize) void {
+        var i: usize = start;
+        while (i + 1 < end) : (i += 2) {
+            const byte = input_bytes[i / 2];
+            output_f32[i] = lut_fp4_e2m1[byte & 0xF];
+            output_f32[i + 1] = lut_fp4_e2m1[byte >> 4];
+        }
+        if (i < end) output_f32[i] = lut_fp4_e2m1[input_bytes[i / 2] & 0xF];
+    }
+
+    fn quantizeFP4(input_f32: []const f32, output_bytes: []u8, pool: *thread_pool_mod.ThreadPool) void {
+        const element_count = input_f32.len;
+        if (element_count == 0) return;
+        const threads_count = @min(pool.threads.len, element_count);
+        const raw_per = element_count / threads_count;
+        const elems_per_thread = @max(2, (raw_per + 1) & ~@as(usize, 1));
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var start: usize = 0;
+        while (start < element_count) : (start += elems_per_thread) {
+            const end = @min(start + elems_per_thread, element_count);
+            pool.spawnWg(&wg, processQuantizeFP4, .{ input_f32, output_bytes, start, end });
+        }
+        wg.wait();
+    }
+
+    fn processQuantizeFP4(input_f32: []const f32, output_bytes: []u8, start: usize, end: usize) void {
+        var i: usize = start;
+        while (i + 1 < end) : (i += 2) {
+            const lo: u8 = @as(u8, f32_to_fp4_e2m1(input_f32[i]));
+            const hi: u8 = @as(u8, f32_to_fp4_e2m1(input_f32[i + 1]));
+            output_bytes[i / 2] = (hi << 4) | lo;
+        }
+        if (i < end) output_bytes[i / 2] = @as(u8, f32_to_fp4_e2m1(input_f32[i]));
+    }
+
+    // -------------------------------------------------------------------------
+    // ComfyUI FP8 cluster quantization.
+    // weight: F8_E4M3 elements; weight_scale: single F32 global scalar.
+    // -------------------------------------------------------------------------
+
+    pub const ComfyFp8Data = struct { weight: []u8, scale: f32 };
+
+    /// Quantize F32 input to ComfyUI FP8 cluster format.
+    /// Computes a global scalar scale = amax / 448.0 and converts elements to F8_E4M3.
+    /// Caller owns the returned weight slice.
+    pub fn quantizeToComfyFp8(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !ComfyFp8Data {
+        var amax: f32 = 0.0;
+        for (input) |v| amax = @max(amax, @abs(v));
+
+        const fp8_max: f32 = 448.0;
+        const scale: f32 = if (amax > 0.0) amax / fp8_max else 1.0;
+        const inv_scale = 1.0 / scale;
+
+        // Pre-scale so that the F8 conversion round-trips correctly via *scale
+        const scaled = try allocator.alloc(f32, input.len);
+        defer allocator.free(scaled);
+        for (input, 0..) |x, i| scaled[i] = x * inv_scale;
+
+        const weight = try allocator.alloc(u8, input.len);
+        errdefer allocator.free(weight);
+        try convertTypeSimple(scaled, weight, pool, .F8_E4M3);
+
+        return .{ .weight = weight, .scale = scale };
+    }
+
+    // -------------------------------------------------------------------------
+    // ComfyUI MXFP cluster quantization.
+    // Produces weight and scale.
+    // -------------------------------------------------------------------------
+
+    pub const ComfyMxfpData = struct { weight: []u8, scale: []u8 };
+
+    /// Quantize F32 input to MXFP4 cluster format
+    ///   weight: sequential OCP nibbles (8 per U32, stored as raw bytes)
+    ///   scale:  E8M0 byte per 32-element block
+    /// Caller owns both returned slices.
+    pub fn quantizeToComfyMxfp4(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !ComfyMxfpData {
+        const n = input.len;
+        if (n % 32 != 0) return error.ElementCountNotMultipleOf32;
+        const n_blocks = n / 32;
+
+        // Quantize via GGML to get GGUF mxfp4 blocks: [E8M0 byte][16 × packed nibbles]
+        const gguf_buf = try allocator.alloc(u8, n_blocks * 17);
+        defer allocator.free(gguf_buf);
+        try convertTypeGguf(input, gguf_buf, pool, .mxfp4, 32, 17);
+
+        const weight = try allocator.alloc(u8, n / 2);
+        errdefer allocator.free(weight);
+        const scale = try allocator.alloc(u8, n_blocks);
+        errdefer allocator.free(scale);
+
+        // Repack: GGUF first-half/second-half → sequential (low nibble = earlier element)
+        // GGUF:    qs[j] = elem[j] | (elem[j+16] << 4)  for j in 0..15
+        // output:  qs[k] = elem[2k] | (elem[2k+1] << 4) for k in 0..15
+        for (0..n_blocks) |bi| {
+            const block = gguf_buf[bi * 17 .. bi * 17 + 17];
+            scale[bi] = block[0];
+            var nibbles: [32]u8 = undefined;
+            for (0..16) |j| {
+                nibbles[j]      = block[1 + j] & 0xF;
+                nibbles[j + 16] = block[1 + j] >> 4;
+            }
+            const base = bi * 16;
+            for (0..16) |k| {
+                weight[base + k] = nibbles[2 * k] | (nibbles[2 * k + 1] << 4);
+            }
+        }
+
+        return .{ .weight = weight, .scale = scale };
+    }
+
+    /// Quantize F32 data to ComfyUI MXFP8 cluster format.
+        /// Returns weight (F8_E4M3, 1 byte per element) and scale (E8M0, 1 byte per block of 32).
+        pub fn quantizeToComfyMxfp8(
+        allocator: std.mem.Allocator,
+        f32_slice: []const f32,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !ComfyMxfpData {
+        const n_elements = f32_slice.len;
+        if (n_elements % 32 != 0) return error.InvalidMxfp8Size;
+
+        const n_blocks = n_elements / 32;
+        const weight = try allocator.alloc(u8, n_elements);
+        errdefer allocator.free(weight);
+        const scale = try allocator.alloc(u8, n_blocks);
+        errdefer allocator.free(scale);
+
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const blocks_per_thread = @divTrunc(n_blocks, threads_u64);
+        const leftover = n_blocks - (blocks_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * blocks_per_thread;
+            var end = start + blocks_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            pool.spawnWg(&wg, processMxfp8Blocks, .{ f32_slice, weight, scale, start, end });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .scale = scale };
+    }
+
+    /// Apply cuBLAS MXFP8 scale blocking (equivalent to Python's to_blocked).
+    /// Input:  row-major scales [n_rows * n_scale_cols], one E8M0 byte per 32-element block.
+    /// Output: cuBLAS-tiled scales [n_row_blocks*128 * n_col_blocks*4], zero-padded.
+    /// Mapping: ik=rb*n_col_blocks+cb, flat=ik*512+b*16+a*4+c_within,
+    ///          output[flat/padded_cols][flat%padded_cols] = input[r][c]
+    pub fn toBlockedMxfp8(
+        allocator: std.mem.Allocator,
+        scale_raw: []const u8,
+        n_rows: usize,
+        n_scale_cols: usize,
+    ) ![]u8 {
+        const n_row_blocks = (n_rows + 127) / 128;
+        const n_col_blocks = (n_scale_cols + 3) / 4;
+        const padded_rows = n_row_blocks * 128;
+        const padded_cols = n_col_blocks * 4;
+        const out = try allocator.alloc(u8, padded_rows * padded_cols);
+        @memset(out, 0);
+        for (0..n_rows) |r| {
+            const rb = r / 128;
+            const r_within = r % 128;
+            const a = r_within / 32; // a ∈ [0,4)
+            const b = r_within % 32; // b ∈ [0,32)
+            for (0..n_scale_cols) |c| {
+                const cb = c / 4;
+                const c_within = c % 4;
+                const ik = rb * n_col_blocks + cb;
+                const flat = ik * 512 + b * 16 + a * 4 + c_within;
+                out[flat] = scale_raw[r * n_scale_cols + c];
+            }
+        }
+        return out;
+    }
+
+    fn processMxfp8Blocks(input: []const f32, weight: []u8, scale: []u8, start: u64, end: u64) void {
+        const start_usize: usize = @intCast(start);
+        const end_usize: usize = @intCast(end);
+        for (start_usize..end_usize) |block_idx| {
+            const elem_start = block_idx * 32;
+            const block = input[elem_start..][0..32];
+
+            // Find max absolute value in this block
+            var amax: f32 = 0.0;
+            for (block) |val| {
+                amax = @max(amax, @abs(val));
+            }
+
+            // Handle zero/near-zero blocks
+            if (amax < 1e-30) {
+                scale[block_idx] = 0;
+                for (0..32) |i| weight[elem_start + i] = 0;
+                continue;
+            }
+
+            // OCP MX spec: shared_exp = floor(log2(amax)) + 1
+            // This gives us the scale as 2^shared_exp
+            // E8M0 stores this directly as (shared_exp + 127)
+            const log2_amax = @log2(amax);
+            const shared_exp_unbiased: i32 = @as(i32, @intFromFloat(@floor(log2_amax))) + 1;
+            const shared_exp_biased: i32 = shared_exp_unbiased + 127;
+
+            // Clamp to valid E8M0 range [0, 255]
+            const scale_byte: u8 = @intCast(std.math.clamp(shared_exp_biased, 0, 254));
+            scale[block_idx] = scale_byte;
+
+            // Decode the scale for quantization
+            const scale_f32 = e8m0_to_f32(scale_byte);
+            const inv_scale = 1.0 / scale_f32;
+
+            // Quantize elements: divide by scale then encode as F8_E4M3
+            for (block, 0..) |val, i| {
+                const scaled = val * inv_scale;
+                weight[elem_start + i] = f32_to_fp8_e4m3(scaled);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // GGUF mxfp4 block dequantization.
+    // Block layout (17 bytes, 32 elements):
+    //   [scale: E8M0 u8][qs[0..15]: u8]
+    // qs[j] low nibble  → element j      (j in 0..15)
+    // qs[j] high nibble → element j + 16
+    // -------------------------------------------------------------------------
+
+    fn dequantizeMXFP4Gguf(input_bytes: []const u8, output_f32: []f32, pool: *thread_pool_mod.ThreadPool) void {
+        const block_count = output_f32.len / 32;
+        if (block_count == 0) return;
+        const threads_count = @min(pool.threads.len, block_count);
+        const blocks_per_thread = block_count / threads_count;
+        const leftover = block_count - (blocks_per_thread * threads_count);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: usize = 0;
+        while (i < threads_count) : (i += 1) {
+            const start_block = i * blocks_per_thread;
+            const end_block = start_block + blocks_per_thread + (if (i == threads_count - 1) leftover else 0);
+            pool.spawnWg(&wg, processDequantizeMXFP4Gguf, .{ input_bytes, output_f32, start_block, end_block });
+        }
+        wg.wait();
+    }
+
+    fn processDequantizeMXFP4Gguf(input_bytes: []const u8, output_f32: []f32, start_block: usize, end_block: usize) void {
+        for (start_block..end_block) |b| {
+            const scale = e8m0_to_f32(input_bytes[b * 17]);
+            const qs = input_bytes[b * 17 + 1 .. b * 17 + 17];
+            const elem_base = b * 32;
+            for (0..16) |j| {
+                output_f32[elem_base + j]      = lut_fp4_e2m1[qs[j] & 0xF] * scale;
+                output_f32[elem_base + j + 16] = lut_fp4_e2m1[qs[j] >> 4]  * scale;
+            }
+        }
+    }
+
     fn bf16_to_f32(x: u16) f32 {
         const bits = (@as(u32, x) << 16);
         return @bitCast(bits);
@@ -573,23 +945,36 @@ pub const Quantizer = struct {
     }
 };
 
+fn readFileToOwnedSlice(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
+    const io = std.testing.io;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len > max_size) return error.FileTooLarge;
+    const buf = try allocator.alloc(u8, @intCast(file_len));
+    errdefer allocator.free(buf);
+    _ = try file.readPositionalAll(io, buf, 0);
+    return buf;
+}
+
 test "transform f16 to q8_0" {
     const allocator = std.testing.allocator;
 
     // Load the f16 source file (skip test if artifacts not present)
-    const f16_file = std.fs.cwd().openFile("test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.f16", .{}) catch |err| {
+    const f16_data = readFileToOwnedSlice(
+        allocator,
+        "test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.f16",
+        10 * 1024 * 1024,
+    ) catch |err| {
         if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
-    defer f16_file.close();
-
-    const f16_data = try f16_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     defer allocator.free(f16_data);
 
     // Calculate element count (f16 is 2 bytes per element)
     const element_count: u64 = @intCast(f16_data.len / 2);
 
-    var pool: std.Thread.Pool = undefined;
+    var pool: thread_pool_mod.ThreadPool = undefined;
     try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
     defer pool.deinit();
 
@@ -607,10 +992,11 @@ test "transform f16 to q8_0" {
     try std.testing.expectEqual(q8_0_data.len, 1740800);
 
     // Load the expected q8_0 file
-    const expected_file = try std.fs.cwd().openFile("test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.q8_0", .{});
-    defer expected_file.close();
-
-    const expected_data = try expected_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    const expected_data = try readFileToOwnedSlice(
+        allocator,
+        "test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.q8_0",
+        10 * 1024 * 1024,
+    );
     defer allocator.free(expected_data);
 
     // Compare the results
@@ -630,12 +1016,10 @@ const fixture_dir = "src/test_fixtures";
 fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ fixture_dir, name });
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    return readFileToOwnedSlice(allocator, path, 64 * 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
-    defer file.close();
-    return try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
 }
 
 // Returns the number of mismatches, printing the first few.
@@ -840,4 +1224,151 @@ test "F8_E5M2 scalar decode: matches ml_dtypes reference" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "E8M0 decode: all 256 values match ml_dtypes reference" {
+    const allocator = std.testing.allocator;
+
+    const expected_bytes = (try loadFixture(allocator, "e8m0_decode.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try std.testing.expectEqual(@as(usize, 256), expected.len);
+
+    var mismatches: usize = 0;
+    for (expected, 0..) |exp_val, i| {
+        const got = Quantizer.e8m0_to_f32(@intCast(i));
+        const both_nan = std.math.isNan(exp_val) and std.math.isNan(got);
+        if (!both_nan and got != exp_val) {
+            if (mismatches < 8) {
+                std.debug.print("  E8M0[0x{X:0>2}]: got={e} expected={e}\n", .{ i, got, exp_val });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "FP4/E2M1 LUT decode: all 16 values match ml_dtypes reference" {
+    const allocator = std.testing.allocator;
+
+    const expected_bytes = (try loadFixture(allocator, "fp4_e2m1_decode.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try std.testing.expectEqual(@as(usize, 16), expected.len);
+
+    var mismatches: usize = 0;
+    for (expected, 0..) |exp_val, i| {
+        const got = Quantizer.lut_fp4_e2m1[i];
+        // -0.0 == 0.0 in IEEE 754; only flag truly different magnitudes/signs
+        if (@as(u32, @bitCast(got)) != @as(u32, @bitCast(exp_val))) {
+            if (mismatches < 8) {
+                std.debug.print("  FP4 LUT[{}]: got={d} expected={d}\n", .{ i, got, exp_val });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "FP4/E2M1 scalar encode: matches ml_dtypes reference" {
+    const allocator = std.testing.allocator;
+
+    const inputs_bytes = (try loadFixture(allocator, "fp4_e2m1_encode_inputs.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(inputs_bytes);
+    const expected = (try loadFixture(allocator, "fp4_e2m1_encode_expected.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(expected);
+
+    const inputs: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(inputs_bytes)));
+    try std.testing.expectEqual(inputs.len, expected.len);
+
+    var mismatches: usize = 0;
+    for (inputs, expected, 0..) |val, exp, i| {
+        const got: u8 = Quantizer.f32_to_fp4_e2m1(val);
+        if (got != exp) {
+            if (mismatches < 8) {
+                std.debug.print("  FP4 encode[{}]: f32={d:.4} got=0x{X} expected=0x{X}\n", .{ i, val, got, exp });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "MXFP4 GGUF block decode: matches reference" {
+    const allocator = std.testing.allocator;
+
+    const blocks = (try loadFixture(allocator, "mxfp4_gguf_test_blocks.bin")) orelse return error.SkipZigTest;
+    defer allocator.free(blocks);
+    const expected_bytes = (try loadFixture(allocator, "mxfp4_gguf_test_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const n_blocks = blocks.len / 17;
+    const n_elements = n_blocks * 32;
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try std.testing.expectEqual(n_elements, expected.len);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const got_bytes = try Quantizer.convertTensorData(
+        allocator,
+        blocks,
+        types.DataType.mxfp4,
+        types.DataType.f32,
+        n_elements,
+        &pool,
+    );
+    defer allocator.free(got_bytes);
+
+    const got: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(got_bytes)));
+    try std.testing.expectEqual(n_elements, got.len);
+
+    var mismatches: usize = 0;
+    for (got, expected, 0..) |g, e, i| {
+        if (g != e) {
+            if (mismatches < 8) {
+                std.debug.print("  MXFP4-GGUF[{}]: got={d} expected={d}\n", .{ i, g, e });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "MXFP8 toBlockedMxfp8: matches Python to_blocked reference" {
+    // Validates toBlockedMxfp8 against fixtures generated by gen_quantization_fixtures.py.
+    // Three cases:
+    //   1. [128,128] weight → scales [128,4]:  exact fit, no padding needed
+    //   2. [3840, 64] weight → scales [3840,2]: n_scale_cols=2, column padding needed
+    //   3. [200,  96] weight → scales [200, 3]: both dims need padding
+    const allocator = std.testing.allocator;
+    const Case = struct { n_rows: usize, n_cols: usize, fixture_num: u8 };
+    const cases = [_]Case{
+        .{ .n_rows = 128,  .n_cols = 128, .fixture_num = 1 },
+        .{ .n_rows = 3840, .n_cols = 64,  .fixture_num = 2 },
+        .{ .n_rows = 200,  .n_cols = 96,  .fixture_num = 3 },
+    };
+    inline for (cases) |c| {
+        var inp_name: [32]u8 = undefined;
+        var exp_name: [32]u8 = undefined;
+        const inp_path = try std.fmt.bufPrint(&inp_name, "mxfp8_blocking_input_{d}.u8",    .{c.fixture_num});
+        const exp_path = try std.fmt.bufPrint(&exp_name, "mxfp8_blocking_expected_{d}.u8", .{c.fixture_num});
+
+        const input_bytes    = (try loadFixture(allocator, inp_path)) orelse return error.SkipZigTest;
+        defer allocator.free(input_bytes);
+        const expected_bytes = (try loadFixture(allocator, exp_path)) orelse return error.SkipZigTest;
+        defer allocator.free(expected_bytes);
+
+        const n_scale_cols = (c.n_cols + 31) / 32;
+        try std.testing.expectEqual(c.n_rows * n_scale_cols, input_bytes.len);
+
+        const got = try Quantizer.toBlockedMxfp8(allocator, input_bytes, c.n_rows, n_scale_cols);
+        defer allocator.free(got);
+
+        try std.testing.expectEqual(expected_bytes.len, got.len);
+        try std.testing.expectEqualSlices(u8, expected_bytes, got);
+    }
 }

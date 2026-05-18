@@ -19,7 +19,7 @@ fn pushWakeupEvent(state: *guiState.State) void {
 pub fn loadFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
     state.load_state.store(.loading, .release);
     const path = state.file_selected.?;
-    state.loaded_file = ggufy.fileLoader.TensorFile.loadFile(alloc, arena_alloc, path) catch |err| {
+    state.loaded_file = ggufy.fileLoader.TensorFile.loadFile(state.io, alloc, arena_alloc, path) catch |err| {
         state.load_error = err;
         state.load_state.store(.err, .release);
         pushWakeupEvent(state);
@@ -198,14 +198,14 @@ pub fn doExportTemplate(arena_alloc: std.mem.Allocator, state: *guiState.State) 
     const arch_opt: ?*const ggufy.imageArch.Arch = if (loaded_file.arch != null) &(loaded_file.arch.?) else null;
     const reverse_dims = loaded_file.type == .safetensors;
 
-    const out_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+    const out_file = std.Io.Dir.cwd().createFile(state.io, path, .{ .truncate = true }) catch |err| {
         setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
         return;
     };
-    defer out_file.close();
+    defer out_file.close(state.io);
 
     var write_buf: [8192]u8 = undefined;
-    var file_writer = out_file.writer(&write_buf);
+    var file_writer = out_file.writer(state.io, &write_buf);
     const writer = &file_writer.interface;
 
     conv.writeTemplateFromTensors(
@@ -228,14 +228,14 @@ pub fn doGenSensitivities(arena_alloc: std.mem.Allocator, state: *guiState.State
     const arch_opt: ?*const ggufy.imageArch.Arch = if (loaded_file.arch != null) &(loaded_file.arch.?) else null;
     const threshold: u64 = if (arch_opt) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
 
-    const out_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+    const out_file = std.Io.Dir.cwd().createFile(state.io, path, .{ .truncate = true }) catch |err| {
         setToolStatus(state, true, "Failed: {s}", .{@errorName(err)});
         return;
     };
-    defer out_file.close();
+    defer out_file.close(state.io);
 
     var write_buf: [8192]u8 = undefined;
-    var file_writer = out_file.writer(&write_buf);
+    var file_writer = out_file.writer(state.io, &write_buf);
     const writer = &file_writer.interface;
 
     conv.generateSensitivitiesFromTensors(
@@ -265,6 +265,7 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
     const filename = state.targetFilename();
 
     const opts = conv.ConvertOptions{
+        .io = state.io,
         .path = path,
         .filetype = state.target_filetype,
         .datatype = state.target_dtype,
@@ -296,24 +297,24 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
 
     // Detect source file type.
     const file_type = blk: {
-        const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(state.io, path, .{ .mode = .read_only }) catch |err| {
             state.convert_error = err;
             state.convert_state.store(.err, .release);
             pushWakeupEvent(state);
             return;
         };
         var read_buf: [8]u8 = undefined;
-        var file_reader = file.reader(&read_buf);
+        var file_reader = file.reader(state.io, &read_buf);
         const ft = ggufy.types.FileType.detect_from_file(&file_reader.interface, alloc) catch ggufy.types.FileType.safetensors;
-        file.close();
+        file.close(state.io);
         break :blk ft;
     };
 
-    var convert_timer = std.time.Timer.start() catch null;
+    const convert_start_ts = std.Io.Clock.Timestamp.now(state.io, .awake);
 
     switch (file_type) {
         .safetensors => {
-            var f = ggufy.safetensor.init(path, alloc, arena_alloc, false, false) catch |err| {
+            var f = ggufy.safetensor.init(path, state.io, alloc, arena_alloc, false, false) catch |err| {
                 state.convert_error = err;
                 state.convert_state.store(.err, .release);
                 pushWakeupEvent(state);
@@ -342,7 +343,8 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
         },
     }
 
-    if (convert_timer) |*t| state.convert_elapsed_ns = t.read();
+    const elapsed = convert_start_ts.durationTo(std.Io.Clock.Timestamp.now(state.io, .awake));
+    state.convert_elapsed_ns = @intCast(@max(@as(i96, 0), elapsed.raw.nanoseconds));
 
     // Store output path for display on the done screen.
     const path_len = @min(output_path_str.len, state.convert_output_path_buf.len);

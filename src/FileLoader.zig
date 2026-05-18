@@ -21,20 +21,20 @@ pub const TensorFile = struct {
         self._st_json_data = null;
     }
 
-    pub fn loadFile(allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, path: []const u8) !TensorFile {
+    pub fn loadFile(io: std.Io, allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, path: []const u8) !TensorFile {
         var ret: TensorFile = .{};
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
-        ret.sizeInBytes = try file.getEndPos();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        ret.sizeInBytes = (try file.stat(io)).size;
 
         var read_buffer: [8]u8 = undefined;
-        var reader = file.reader(&read_buffer);
+        var reader = file.reader(io, &read_buffer);
         ret.type = types.FileType.detect_from_file(&reader.interface, allocator) catch types.FileType.safetensors;
-        file.close();
+        file.close(io);
 
         // load data
         switch (ret.type) {
             .safetensors => {
-                var f = try st.init(path, allocator, arena_alloc, false, false);
+                var f = try st.init(path, io, allocator, arena_alloc, false, false);
                 ret.metadata = f.metadata;
                 ret.tensors = f.tensors;
                 // Transfer json_data ownership so metadata slices remain valid.
@@ -44,7 +44,7 @@ pub const TensorFile = struct {
                 f.deinit();
             },
             .gguf => {
-                var f = try gguf.init(path, allocator, arena_alloc, false);
+                var f = try gguf.init(path, io, allocator, arena_alloc, false);
                 ret.metadata = f.metadata;
                 ret.tensors = f.tensors;
                 f.deinit();

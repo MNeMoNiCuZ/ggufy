@@ -13,7 +13,7 @@ comptime {
 
 const window_icon_png = @embedFile("gg.png");
 
-var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa_instance = std.heap.DebugAllocator(.{}){};
 const gpa = gpa_instance.allocator();
 
 var arena = std.heap.ArenaAllocator.init(gpa);
@@ -42,16 +42,19 @@ const gguf_type_names = blk: {
 
 // Safetensors output types that we can convert
 const st_target_types = [_]ggufy.types.DataType{
-    .F32, .F16, .BF16, .F8_E4M3, .F8_E5M2,
+    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .MXFP8_E4M3, .NVFP4,
 };
 
-const st_type_names = blk: {
-    var names: [st_target_types.len][]const u8 = undefined;
-    for (st_target_types, 0..) |t, i| names[i] = @tagName(t);
-    break :blk names;
+// User-facing display names — must stay in sync with st_target_types.
+const st_type_names = [_][]const u8{
+    "F32", "F16", "BF16", "F8_E4M3", "Scaled F8_E4M3", "F8_E5M2", "MXFP8_E4M3", "NVFP4",
 };
 
-pub fn main() !void {
+comptime {
+    std.debug.assert(st_target_types.len == st_type_names.len);
+}
+
+pub fn main(init: std.process.Init) !void {
     if (@import("builtin").os.tag == .windows) {
         dvui.Backend.Common.windowsAttachConsole() catch {};
     }
@@ -63,11 +66,13 @@ pub fn main() !void {
     defer if (state.loaded_file) |*lf| lf.deinit();
 
     // Populate CPU count and thread default before first frame.
+    state.io = init.io;
     state.cpu_count = std.Thread.getCpuCount() catch 4;
     state.target_threads = state.cpu_count;
 
     var backend = try SDLBackend.initWindow(.{
         .allocator = gpa,
+        .io = init.io,
         .size = .{ .w = 800.0, .h = 600.0 },
         .min_size = .{ .w = 250.0, .h = 350.0 },
         .vsync = true,
@@ -443,7 +448,7 @@ fn showInputFile() void {
             state.prev_template_path_len = cur_tmpl_len;
             const type_name: []const u8 = if (state.template_path) |tp| blk: {
                 // Template overrides dtype: derive suffix from the template's tensor types.
-                break :blk conv.templateTypeSuffix(tp, state.target_filetype, fa) catch "";
+                break :blk conv.templateTypeSuffix(state.io, tp, state.target_filetype, fa) catch "";
             } else if (state.target_dtype) |dt|
                 @tagName(dt)
             else blk: {
@@ -845,6 +850,7 @@ fn launchConversion(fa: std.mem.Allocator) void {
     const filename = state.targetFilename();
 
     const opts = conv.ConvertOptions{
+        .io = state.io,
         .path = state.file_selected.?,
         .filetype = state.target_filetype,
         .datatype = state.target_dtype,
@@ -872,7 +878,7 @@ fn launchConversion(fa: std.mem.Allocator) void {
     state.same_file_error = false;
 
     const file_exists = blk: {
-        std.fs.cwd().access(out_path, .{}) catch break :blk false;
+        std.Io.Dir.cwd().access(state.io, out_path, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -1183,8 +1189,8 @@ fn showTensorBranch(tensor: ggufy.types.Tensor, idx: usize) void {
     const fa = frameArena();
 
     var dims_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&dims_buf);
-    const w = fbs.writer();
+    var dims_writer = std.Io.Writer.fixed(&dims_buf);
+    const w = &dims_writer;
     w.writeByte('[') catch {};
     for (tensor.dims, 0..) |d, j| {
         if (j > 0) w.writeAll(" x ") catch {};
@@ -1199,7 +1205,7 @@ fn showTensorBranch(tensor: ggufy.types.Tensor, idx: usize) void {
     const size_str = formatBytes(tensor.size, &size_buf);
 
     const line = std.fmt.allocPrint(fa, "{s}  [{s}]  Dimensions: {s}  ({d} total), Size: {s}  Offset: {d}", .{
-        tensor.name, tensor.type, fbs.getWritten(), n, size_str, tensor.offset,
+        tensor.name, tensor.type, dims_writer.buffered(), n, size_str, tensor.offset,
     }) catch tensor.name;
 
     dvui.labelNoFmt(@src(), line, .{}, .{ .expand = .horizontal, .id_extra = idx });

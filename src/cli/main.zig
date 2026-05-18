@@ -17,11 +17,10 @@ const Command = enum {
     sensitivities,
 };
 
-pub fn main() !void {
-    var timer = std.time.Timer.start() catch null;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
+    const allocator = init.gpa;
 
     const params = comptime clap.parseParamsComptime(
         \\-h, --help                     Display this help and exit.
@@ -57,23 +56,23 @@ pub fn main() !void {
     // This is optional. You can also pass `.{}` to `clap.parse` if you don't
     // care about the extra information `Diagnostic` provides.
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, parsers, .{
+    var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
         // Report useful error and exit.
-        try diag.reportToFile(.stderr(), err);
+        try diag.reportToFile(io, std.Io.File.stderr(), err);
         return err;
     };
     defer res.deinit();
 
     var stderr_buffer: [256]u8 = undefined;
-    var err_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var err_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &err_writer.interface;
     _ = stderr;
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     if (res.args.help != 0) {
@@ -89,7 +88,7 @@ pub fn main() !void {
         try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
-        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
+        return clap.helpToFile(io, std.Io.File.stderr(), clap.Help, &params, .{});
     }
 
     const command = res.positionals[0] orelse {
@@ -122,20 +121,20 @@ pub fn main() !void {
     else
         null;
 
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
 
     var read_buffer: [8]u8 = undefined;
-    var reader = file.reader(&read_buffer);
+    var reader = file.reader(io, &read_buffer);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
     const file_type = types.FileType.detect_from_file(&reader.interface, allocator) catch types.FileType.safetensors;
-    file.close();
+    file.close(io);
     switch (file_type) {
         .safetensors => {
-            var f = try st.init(path, allocator, arena_alloc, false, false);
+            var f = try st.init(path, io, allocator, arena_alloc, false, false);
             defer f.deinit();
 
             switch (command) {
@@ -150,6 +149,7 @@ pub fn main() !void {
                 },
                 .convert => {
                     conv.convert(&f, .{
+                        .io = io,
                         .path = path,
                         .filetype = filetype,
                         .datatype = datatype,
@@ -177,10 +177,10 @@ pub fn main() !void {
                         try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
                     else
                         "template.json";
-                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-                    defer out_file.close();
+                    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+                    defer out_file.close(io);
                     var writer_buffer: [8192]u8 = undefined;
-                    var out_writer = out_file.writer(&writer_buffer);
+                    var out_writer = out_file.writer(io, &writer_buffer);
                     var writer = &out_writer.interface;
                     const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
                     try conv.writeTemplateFromTensors(
@@ -198,10 +198,10 @@ pub fn main() !void {
                         try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
                     else
                         "sensitivities.json";
-                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-                    defer out_file.close();
+                    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+                    defer out_file.close(io);
                     var writer_buffer: [8192]u8 = undefined;
-                    var out_writer = out_file.writer(&writer_buffer);
+                    var out_writer = out_file.writer(io, &writer_buffer);
                     var writer = &out_writer.interface;
                     const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
                     const threshold: u64 = if (arch_ptr) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
@@ -227,7 +227,7 @@ pub fn main() !void {
             }
         },
         .gguf => {
-            var f = try gguf.init(path, allocator, arena_alloc, false);
+            var f = try gguf.init(path, io, allocator, arena_alloc, false);
             defer f.deinit();
 
             std.log.info("GGUF format version {}", .{f.version});
@@ -258,10 +258,10 @@ pub fn main() !void {
                         try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
                     else
                         "template.json";
-                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-                    defer out_file.close();
+                    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+                    defer out_file.close(io);
                     var writer_buffer: [8192]u8 = undefined;
-                    var out_writer = out_file.writer(&writer_buffer);
+                    var out_writer = out_file.writer(io, &writer_buffer);
                     var writer = &out_writer.interface;
                     try f.writeTemplate(writer);
                     try writer.flush();
@@ -272,10 +272,10 @@ pub fn main() !void {
                         try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
                     else
                         "sensitivities.json";
-                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-                    defer out_file.close();
+                    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+                    defer out_file.close(io);
                     var writer_buffer: [8192]u8 = undefined;
-                    var out_writer = out_file.writer(&writer_buffer);
+                    var out_writer = out_file.writer(io, &writer_buffer);
                     var writer = &out_writer.interface;
                     const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
                     const threshold: u64 = if (arch_ptr) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
@@ -294,8 +294,6 @@ pub fn main() !void {
     }
     try stdout.flush();
     std.log.info("Total bytes used in arena allocator: {}", .{arena.queryCapacity()});
-    if (timer) |*t| {
-        const elapsed = t.read();
-        std.log.info("Completed in {d:.2} seconds.", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s});
-    }
+    const elapsed = start_ts.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
+    std.log.info("Completed in {d:.2} seconds.", .{@as(f64, @floatFromInt(elapsed.raw.nanoseconds)) / std.time.ns_per_s});
 }
