@@ -24,6 +24,10 @@ pub const Arch = struct {
     upcast_from_bf16: []const []const u8 = &.{},
     /// Keys that must pass through as-is in NVFP4 output (ComfyUI reads their shape[1] for arch detection)
     keys_nvfp4_passthrough: []const []const u8 = &.{},
+    /// JSON object with base architecture configs (e.g. vae/audio_vae/vocoder) that may be absent
+    /// from fine-tuned source files. Top-level keys are merged into the output `config` KV,
+    /// with the source file's keys taking priority over these defaults.
+    base_config_json: []const u8 = "",
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -261,6 +265,36 @@ pub const ltxv = Arch{
     .threshhold = null,
 };
 
+pub const ltx2 = Arch{
+    // ComfyUI identifies both v1 and 2.x by the "ltxv" architecture string.
+    .name = "ltxv",
+    .base_config_json = @embedFile("configs/ltx23_base_config.json"),
+    .keys_detect = &.{
+        &.{
+            "adaln_single.emb.timestep_embedder.linear_2.weight",
+            "transformer_blocks.47.scale_shift_table",
+            "patchify_proj.weight",
+        },
+    },
+    // Tensors that must stay in source precision:
+    //   - scale_shift_table: conditioning signals (multiple variants in 2.x)
+    //   - _norm.weight: RMSNorm scale vectors
+    //   - .bias: bias vectors must not be block-quantized
+    //   - adaln_single: AdaLN conditioning projections, sensitive and small outer-dim shapes
+    //   - patchify_proj.weight / proj_out.weight: patch embed/unembed, outer-dim = 128
+    //   - learnable_registers: embedding tokens [128, X] — Python shape[-1]=128, not divisible by Q4_K block size 256
+    .keys_hiprec = &.{
+        "scale_shift_table",
+        "_norm.weight",
+        ".bias",
+        "adaln_single",
+        "patchify_proj.weight",
+        "proj_out.weight",
+        "learnable_registers",
+    },
+    .threshhold = null,
+};
+
 pub const sdxl = Arch{
     .name = "sdxl",
     .shape_fix = true,
@@ -378,6 +412,7 @@ pub const arch_list = [_]*const Arch{
     &aura,
     &hidream,
     &cosmos,
+    &ltx2,
     &ltxv,
     &hyvid,
     &wan,
@@ -587,4 +622,30 @@ test "qwen upcast from bf16 - no false positives" {
     try std.testing.expect(!qwen.shouldUpcast("transformer_blocks.0.attn.norm_k.bias"));
     try std.testing.expect(!qwen.shouldUpcast("some.other.weight"));
     try std.testing.expect(!qwen.shouldUpcast("norm_k.weight.extra")); // suffix only, not contains
+}
+
+test "detect ltxv v1 architecture" {
+    const names = [_][]const u8{
+        "adaln_single.emb.timestep_embedder.linear_2.weight",
+        "transformer_blocks.27.scale_shift_table",
+        "caption_projection.linear_2.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("ltxv", arch.?.name);
+}
+
+test "detect ltx2 architecture" {
+    const names = [_][]const u8{
+        "model.diffusion_model.adaln_single.emb.timestep_embedder.linear_2.weight",
+        "model.diffusion_model.transformer_blocks.47.scale_shift_table",
+        "model.diffusion_model.patchify_proj.weight",
+        "model.diffusion_model.audio_adaln_single.linear.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    // Both ltxv and ltx2 write "ltxv" as general.architecture for ComfyUI compatibility.
+    try std.testing.expectEqualStrings("ltxv", arch.?.name);
+    // But it must resolve to the ltx2 constant, not ltxv, to get the correct hiprec list.
+    try std.testing.expectEqual(&ltx2, arch.?);
 }

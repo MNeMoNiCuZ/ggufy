@@ -757,10 +757,22 @@ fn nearestCompatibleType(
 ) void {
     const sourceType = types.DataType.fromString(t.type) catch unreachable;
     if (opts.filetype == .gguf) {
+        // FP8 has no GGUF equivalent — upcast to F16.
         if (sourceType == .F8_E4M3 or sourceType == .F8_E5M2) {
             const ggml_type = gguf.GgmlType.f16;
             t.type = @tagName(ggml_type);
             t.size = ggml_type.calcSizeInBytes(num_elements);
+            return;
+        }
+        // BF16 is technically representable in GGUF (type 30), but ComfyUI's
+        // quant_shape_to_byte_shape treats it like a quantized type (block_size=1,
+        // bytes_per_block=2) and doubles the shape, causing load-time mismatches.
+        // Upcast to F32 to match the behaviour of reference quantisers.
+        if (sourceType == .BF16) {
+            const ggml_type = gguf.GgmlType.f32;
+            t.type = @tagName(ggml_type);
+            t.size = ggml_type.calcSizeInBytes(num_elements);
+            return;
         }
     }
     return;
@@ -847,6 +859,56 @@ fn applyShapeFix(
     }
 }
 
+/// Merges top-level keys from `base_json` into the `config` KV stored in
+/// `metadata`, skipping any key that the source config already defines.
+/// This fills in architectural constants (vae, audio_vae, vocoder) that
+/// fine-tuned safetensors files typically omit.
+fn mergeBaseConfig(
+    metadata: *std.json.ObjectMap,
+    base_json: []const u8,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    const base = try std.json.parseFromSlice(std.json.Value, arena_alloc, base_json, .{});
+
+    const existing_str: []const u8 = if (metadata.get("config")) |v| switch (v) {
+        .string => |s| s,
+        else => "{}",
+    } else "{}";
+    const existing = try std.json.parseFromSlice(std.json.Value, arena_alloc, existing_str, .{});
+
+    // Build merged object: start from base, let source override.
+    var merged: std.json.ObjectMap = .empty;
+    var base_it = base.value.object.iterator();
+    while (base_it.next()) |e| try merged.put(arena_alloc, e.key_ptr.*, e.value_ptr.*);
+    var src_it = existing.value.object.iterator();
+    while (src_it.next()) |e| try merged.put(arena_alloc, e.key_ptr.*, e.value_ptr.*);
+
+    const merged_str = try std.json.Stringify.valueAlloc(arena_alloc, std.json.Value{ .object = merged }, .{});
+    try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "config"), .{ .string = merged_str });
+}
+
+/// Maps the target quantization type to a GGUF general.file_type integer.
+/// Values follow the llama.cpp LLAMA_FTYPE_* convention.
+fn ggufFileType(datatype: ?types.DataType) i64 {
+    const dt = datatype orelse return 1; // default: MOSTLY_F16
+    return switch (dt) {
+        .f32  => 0,
+        .f16  => 1,
+        .q4_0 => 2,
+        .q4_1 => 3,
+        .q5_0 => 8,
+        .q5_1 => 9,
+        .q8_0 => 7,
+        .q2_k => 10,
+        .q3_k => 12,
+        .q4_k => 15,
+        .q5_k => 17,
+        .q6_k => 18,
+        .bf16 => 37,
+        else  => 1,
+    };
+}
+
 fn writeGguf(
     f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
@@ -884,8 +946,7 @@ fn writeGguf(
     const arch_name = opts.arch_override orelse arch.name;
     try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch_name });
     try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
-    // TODO: determine from the target dtype.
-    try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = 7 });
+    try out_gguf.metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = ggufFileType(opts.datatype) });
 
     // Template metadata takes priority over source-file metadata.
     if (template_metadata) |meta| {
@@ -907,6 +968,13 @@ fn writeGguf(
     while (extra_it.next()) |entry| {
         if (!out_gguf.metadata.contains(entry.key_ptr.*))
             try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    // Merge arch base config (vae/audio_vae/vocoder etc.) into the `config` KV.
+    // Fine-tuned source files often omit these sections; they are architectural
+    // constants for the base model that ComfyUI needs to initialise decoders.
+    if (arch.base_config_json.len > 0) {
+        try mergeBaseConfig(&out_gguf.metadata, arch.base_config_json, arena_alloc);
     }
 
     out_gguf.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {

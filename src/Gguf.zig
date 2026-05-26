@@ -489,6 +489,7 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
                         try self.maybeWritePadding(size, &writer.interface);
                         callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
                         count += 1;
+                        break;
                     }
             }
         }
