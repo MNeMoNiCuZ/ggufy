@@ -109,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
         if (state.file_selected_ready.load(.acquire)) {
             std.log.debug("Loading file: {s}", .{state.file_selected.?});
             state.file_selected_ready.store(false, .release);
+            state.load_state.store(.loading, .release);
             if (state.loaded_file) |*lf| lf.deinit();
             _ = arena.reset(.free_all);
             state.loaded_file = null;
