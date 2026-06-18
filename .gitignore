@@ -6,3 +6,5 @@ zig-pkg
 test-models
 # Python virtual environment for generating comparison data
 venv
+input/
+output/
