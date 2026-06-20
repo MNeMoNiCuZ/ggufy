@@ -312,6 +312,34 @@ Build with zig:
 zig build
 ```
 
+## Docker
+
+ggufy can be built and run via Docker using the included `docker-compose.yml`.
+
+### Building
+
+```bash
+docker compose build
+```
+
+### Running
+
+Place input files in the `./input` directory and output files will be written to `./output`. Run ggufy with any arguments:
+
+```bash
+docker compose run --rm ggufy {args}
+```
+
+Where `{args}` are any ggufy command and options. For example:
+
+```bash
+# Convert a model to Q4_K
+docker compose run --rm ggufy convert -d q4_k --output-dir /app/output /app/input/model.safetensors
+
+# View file header
+docker compose run --rm ggufy header /app/input/model.safetensors
+```
+
 ## Acknowledgements
 
 - [ggml](https://github.com/ggml-org/ggml) ggufy uses ggml for quantization

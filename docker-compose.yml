@@ -1,0 +1,11 @@
+services:
+  ggufy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: ggufy:latest
+    volumes:
+      - ./input:/app/input:ro
+      - ./output:/app/output
+    working_dir: /app

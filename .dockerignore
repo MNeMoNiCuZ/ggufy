@@ -1,0 +1,9 @@
+.git
+.gitmodules
+.gitignore
+Dockerfile
+docker-compose.yml
+input
+output
+.zig-cache
+zig-out
