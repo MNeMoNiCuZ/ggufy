@@ -720,6 +720,9 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
             (num_elements / n_cols) % 128 == 0 and !arch.isNvfp4Passthrough(t.name),
         .INT8 => t.dims.len == 2 and n_cols >= 1,
         .INT8_CONVROT => t.dims.len == 2 and n_cols % TensorClusters.int8_convrot_group_size == 0,
+        // int4 nibble-packs two columns per byte, so the column count must be even.
+        .INT4 => t.dims.len == 2 and n_cols >= 2 and n_cols % 2 == 0,
+        .INT4_CONVROT => t.dims.len == 2 and n_cols % TensorClusters.int4_convrot_group_size == 0,
         else => false,
     };
 }

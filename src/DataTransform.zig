@@ -986,6 +986,116 @@ pub const Quantizer = struct {
     }
 
     // -------------------------------------------------------------------------
+    // int4 (symmetric per-row, optional ConvRot).
+    //
+    // A 4-bit sibling of the int8_tensorwise path: same per-row amax scaling and
+    // Hadamard convrot, but values are signed 4-bit ([-8, 7]) packed two per byte
+    // along the row (column) dimension. This is ggufy's own "int4_tensorwise"
+    // layout — no upstream ComfyUI loader exists for it. Packing: element 2k goes
+    // in the low nibble of packed byte k, element 2k+1 in the high nibble; each
+    // nibble is the value's two's-complement low 4 bits.
+    //   scale[r] = max(amax(row[r]) / 7, 1e-30)
+    //   q[r,c]   = clamp(round_half_even(row[r,c] / scale[r]), -8, 7)
+    // `cols` must be even. Caller owns both slices.
+    // -------------------------------------------------------------------------
+
+    pub const Int4Data = struct {
+        weight: []u8, // nibble-packed signed 4-bit values, [rows * cols / 2]
+        scale: []f32, // per-row scale, [rows]
+    };
+
+    pub fn quantizeToInt4(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot: bool,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !Int4Data {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+        if (cols % 2 != 0) return error.ColsNotEven;
+
+        // Rotation is in-place, so it needs a mutable copy; plain int4 reads the input directly.
+        var rotated: []f32 = &.{};
+        defer if (convrot) allocator.free(rotated);
+        if (convrot) {
+            rotated = try allocator.alloc(f32, input.len);
+            @memcpy(rotated, input);
+            try rotateGroupwiseInPlace(rotated, rows, cols, group_size, pool);
+        }
+        const work: []const f32 = if (convrot) rotated else input;
+
+        const weight = try allocator.alloc(u8, rows * (cols / 2));
+        errdefer allocator.free(weight);
+        const scale = try allocator.alloc(f32, rows);
+        errdefer allocator.free(scale);
+
+        // Rows are independent (each carries its own scale) — quantize them in parallel.
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeInt4Rows, .{ work, weight, scale, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .scale = scale };
+    }
+
+    fn quantizeInt4Rows(
+        work: []const f32,
+        weight: []u8,
+        scale: []f32,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const packed_cols = cols / 2;
+        for (start_row..end_row) |r| {
+            const row = work[r * cols .. r * cols + cols];
+            var amax: f32 = 0.0;
+            for (row) |v| {
+                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
+            }
+            const s: f32 = @max(amax / 7.0, 1e-30);
+            scale[r] = s;
+            for (0..packed_cols) |pc| {
+                const lo = quantizeInt4Nibble(row[2 * pc], s);
+                const hi = quantizeInt4Nibble(row[2 * pc + 1], s);
+                weight[r * packed_cols + pc] = lo | (hi << 4);
+            }
+        }
+    }
+
+    /// Quantize one value to a signed-4-bit nibble (two's-complement low 4 bits).
+    fn quantizeInt4Nibble(v: f32, s: f32) u8 {
+        // True division (not multiply-by-reciprocal) to match torch's x/scale bit-for-bit.
+        const q = std.math.clamp(roundHalfToEven(v / s), -8.0, 7.0);
+        return @as(u8, @bitCast(@as(i8, @intFromFloat(q)))) & 0x0F;
+    }
+
+    /// Convenience wrapper: ConvRot int4 (always rotates). See `quantizeToInt4`.
+    pub fn quantizeToConvrotInt4(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !Int4Data {
+        return quantizeToInt4(allocator, input, rows, cols, true, group_size, pool);
+    }
+
+    // -------------------------------------------------------------------------
     // ComfyUI MXFP cluster quantization.
     // Produces weight and scale.
     // -------------------------------------------------------------------------
