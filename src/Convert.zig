@@ -701,6 +701,33 @@ fn resolvedFamilies(opts: ConvertOptions) QuantizationFamilies {
     return .{ .allow_0 = true, .allow_1 = true, .allow_k = true };
 }
 
+/// Whether `name` is a token-embedding lookup table (an nn.Embedding weight).
+///
+/// These are 2D float tensors, indistinguishable by shape from a Linear weight,
+/// but they must not be quantized (see the call site in assignTensorType). We
+/// match a curated set of terminal module names that are unambiguously
+/// nn.Embedding. Positional/patch/time "embedder" projections (pos_embedder,
+/// x_embedder, patch_embed, add_embedding, context_embedder, img_emb, ...) are
+/// Linear/Conv and are intentionally NOT matched — they quantize fine, and the
+/// suffixes below don't collide with them. The misclassification cost is
+/// asymmetric: wrongly protecting a Linear only costs a little file size, while
+/// wrongly quantizing an Embedding breaks the model, so we err toward matching.
+fn isEmbeddingWeight(name: []const u8) bool {
+    const suffixes = [_][]const u8{
+        ".embed.weight", // Anima llm_adapter, misc adapters
+        ".embed_tokens.weight", // HF-style token embeddings
+        ".token_embedding.weight",
+        ".token_embed.weight",
+        ".word_embeddings.weight",
+        ".tok_embeddings.weight",
+        ".wte.weight", // GPT-2 style
+    };
+    for (suffixes) |s| {
+        if (std.mem.endsWith(u8, name, s)) return true;
+    }
+    return false;
+}
+
 /// Decide the GGUF type for a single tensor and update its `type` and `size`
 /// fields in-place. Does not touch `offset` — that's done by the caller.
 fn assignTensorType(
@@ -729,6 +756,18 @@ fn assignTensorType(
     // is read as the element count). This is a structural rule that generalizes
     // across architectures, replacing most per-model hi-precision lists.
     if (opts.filetype == .gguf and t.dims.len <= 1) return nearestCompatibleType(t, opts, num_elements);
+
+    // ComfyUI compatibility: never quantize token-embedding lookup tables. An
+    // nn.Embedding weight is a 2D float table indexed by token IDs, not a Linear
+    // matmul weight, and ComfyUI's quant loaders only wrap Linear layers. A block-
+    // or int-quantized Embedding therefore fails to load (e.g. Anima's
+    // llm_adapter.embed.weight → "Only Tensors of floating point and complex dtype
+    // can require gradients"). A safetensors/GGUF file carries no module-type
+    // metadata, so we can't introspect Linear-vs-Embedding; we classify by name,
+    // the same way llama.cpp/GPTQ/AWQ treat token_embd. Like the 1D rule above,
+    // this is a structural rule that generalizes across architectures, and it
+    // applies to every output format (leaving the tensor in its source precision).
+    if (isEmbeddingWeight(t.name)) return nearestCompatibleType(t, opts, num_elements);
 
     // Too small to quantize - use nearest compatible type
     if (num_elements < threshold) return nearestCompatibleType(t, opts, num_elements);
@@ -1469,6 +1508,45 @@ test "assignTensorType: large 2D weights are quantized" {
     var t = types.Tensor{ .name = "blocks.0.attn.wq.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
     try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("q8_0", t.type);
+}
+
+test "isEmbeddingWeight: matches embedding tables, not embedder projections" {
+    // nn.Embedding lookup tables — must be protected.
+    try testing.expect(isEmbeddingWeight("model.diffusion_model.llm_adapter.embed.weight"));
+    try testing.expect(isEmbeddingWeight("text_model.embed_tokens.weight"));
+    try testing.expect(isEmbeddingWeight("transformer.wte.weight"));
+    try testing.expect(isEmbeddingWeight("foo.token_embedding.weight"));
+    // Linear/Conv "embedder" projections and unrelated weights — must NOT match.
+    try testing.expect(!isEmbeddingWeight("blocks.0.pos_embedder.weight"));
+    try testing.expect(!isEmbeddingWeight("x_embedder.proj.weight"));
+    try testing.expect(!isEmbeddingWeight("patch_embed.proj.weight"));
+    try testing.expect(!isEmbeddingWeight("add_embedding.linear_1.weight"));
+    try testing.expect(!isEmbeddingWeight("blocks.0.attn.wq.weight"));
+}
+
+test "assignTensorType: embedding tables are never quantized (gguf)" {
+    const opts = testOpts(.q8_0);
+    // Anima's T5 embedding table: 2D, well above threshold — only the embedding
+    // rule can keep it float (vs. the 1D and small-tensor rules).
+    var dims = [_]usize{ 32128, 1024 };
+    const n: u64 = 32128 * 1024;
+    var t = types.Tensor{ .name = "model.diffusion_model.llm_adapter.embed.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, n, &imagearch.anima, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    // BF16 -> f32 via nearestCompatibleType; crucially NOT q8_0.
+    try testing.expectEqualStrings("f32", t.type);
+}
+
+test "assignTensorType: embedding tables are never clustered (safetensors INT8_CONVROT)" {
+    var opts = testOpts(.INT8_CONVROT);
+    opts.filetype = .safetensors;
+    // 1024 % int8_convrot_group_size == 0, so absent the embedding rule this
+    // would pass clusterEligible and be INT8-quantized (the reported bug).
+    var dims = [_]usize{ 32128, 1024 };
+    const n: u64 = 32128 * 1024;
+    var t = types.Tensor{ .name = "model.diffusion_model.llm_adapter.embed.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, n, &imagearch.anima, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    // Left in source precision, NOT INT8_CONVROT.
+    try testing.expectEqualStrings("BF16", t.type);
 }
 
 /// Write a minimal two-tensor SafeTensors file for the size-prediction test. Data is a

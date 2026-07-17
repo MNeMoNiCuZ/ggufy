@@ -48,8 +48,11 @@ test "illustrious (sdxl finetune, non-diffusers format)" {
 
 // ── Other ─────────────────────────────────────────────────────────────────────
 
-test "anima (cosmos)" {
-    try expectArch(@embedFile("test_fixtures/anima.json"), "cosmos");
+// Anima = Cosmos-Predict2 + llm_adapter. It shares Cosmos's backbone but is
+// detected distinctly (and must be matched before base cosmos, whose key set is
+// a subset). See the `anima` arch note in ImageArch.zig.
+test "anima (cosmos + llm_adapter)" {
+    try expectArch(@embedFile("test_fixtures/anima.json"), "anima");
 }
 
 test "lumina2 (zit, with model.diffusion_model prefix)" {

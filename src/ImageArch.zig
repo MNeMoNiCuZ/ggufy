@@ -215,6 +215,63 @@ pub const hidream = Arch{
     .threshhold = null,
 };
 
+// Anima is Cosmos-Predict2 (MiniTrainDIT) with an extra bolted-on T5 text
+// adapter (`llm_adapter`). It shares Cosmos's entire backbone, so its detect
+// keys are Cosmos's two plus the llm_adapter discriminator. This mirrors
+// ComfyUI's own model_detection.py, which starts at "cosmos_predict2" and
+// reclassifies to "anima" iff `llm_adapter.blocks.0.cross_attn.q_proj.weight`
+// is present. "anima" is a valid `general.architecture` value for the
+// ComfyUI-GGUF loader (it's in PIG_ARCH_LIST), so we can name it distinctly.
+//
+// Must be listed BEFORE `cosmos` in arch_list: base Cosmos's key set is a
+// subset of Anima's, so cosmos would otherwise match first.
+//
+// The ENTIRE `llm_adapter` is kept high-precision (not just its embedding),
+// matching the reference converter silveroxides/convert_to_quant (its
+// ANIMA_LAYER_KEYNAMES lists "llm_adapter" as highprec). Two reasons:
+//   1. ComfyUI: the adapter's `embed.weight` is an nn.Embedding table that
+//      can't be block/int-quantized (also caught generically by
+//      isEmbeddingWeight() in Convert.zig).
+//   2. Forge Neo: its loader's `process_anima` MOVES the whole llm_adapter out
+//      of the transformer and into the *text-encoder* component. If any adapter
+//      tensor is quantized (carries `.comfy_quant`), Forge loads the text
+//      encoder via its MixedPrecision path, which builds non-quantized layers
+//      (the `embed`) at fp32 while the quantized projections dequantize to
+//      bf16. The adapter then computes rotary embeddings from the fp32 embed
+//      output and applies them to q/k, but v (no rope) stays bf16 — so
+//      scaled_dot_product_attention gets mismatched dtypes and throws. Keeping
+//      the adapter fully bf16 means the text encoder has no `.comfy_quant`, so
+//      it loads in plain bf16 and everything matches. (bf16 Linears load fine
+//      in ComfyUI too, so this does not regress the working ComfyUI path.)
+pub const anima = Arch{
+    .name = "anima",
+    .keys_detect = &.{
+        &.{
+            "blocks.0.mlp.layer1.weight",
+            "blocks.0.adaln_modulation_cross_attn.1.weight",
+            "llm_adapter.blocks.0.cross_attn.q_proj.weight",
+        },
+    },
+    // High-precision set mirrors silveroxides/convert_to_quant's ANIMA_LAYER_KEYNAMES
+    // (the reference converter): the llm_adapter (see above), plus the first block,
+    // block 1's adaln modulation, the final layer, and the timestep/patch embedders.
+    // These are the small, sensitivity-critical layers that reference tool keeps in
+    // full precision for quality. Patterns are bare substrings (isHighPrecision matches
+    // the full tensor name), so "blocks.0." also covers the — already-hiprec — llm_adapter
+    // block 0, which is harmless. pos_embedder is retained from the Cosmos base.
+    .keys_hiprec = &.{
+        "pos_embedder",
+        "llm_adapter",
+        "blocks.0.",
+        "blocks.1.adaln_modulation",
+        "final_layer",
+        "t_embedder",
+        "x_embedder",
+    },
+    .keys_ignore = &.{ "_extra_state", "accum_" },
+    .threshhold = null,
+};
+
 pub const cosmos = Arch{
     .name = "cosmos",
     .keys_detect = &.{
@@ -445,6 +502,7 @@ pub const arch_list = [_]*const Arch{
     &sd3,
     &aura,
     &hidream,
+    &anima,
     &cosmos,
     &ltx2,
     &ltxv,
@@ -624,6 +682,42 @@ test "ignore key detection" {
     try std.testing.expect(cosmos.shouldIgnore("layer._extra_state.data"));
     try std.testing.expect(cosmos.shouldIgnore("accum_grad"));
     try std.testing.expect(!cosmos.shouldIgnore("normal.weight"));
+}
+
+test "anima vs cosmos detection priority" {
+    // A base-Cosmos state dict (no llm_adapter) must resolve to cosmos.
+    const cosmos_only = [_][]const u8{
+        "net.blocks.0.mlp.layer1.weight",
+        "net.blocks.0.adaln_modulation_cross_attn.1.weight",
+    };
+    try std.testing.expectEqualStrings("cosmos", detectArch(&cosmos_only).?.name);
+
+    // Adding the llm_adapter discriminator must flip detection to anima, even
+    // though the cosmos key set is still fully present.
+    const anima_sd = [_][]const u8{
+        "model.diffusion_model.blocks.0.mlp.layer1.weight",
+        "model.diffusion_model.blocks.0.adaln_modulation_cross_attn.1.weight",
+        "model.diffusion_model.llm_adapter.blocks.0.cross_attn.q_proj.weight",
+    };
+    try std.testing.expectEqualStrings("anima", detectArch(&anima_sd).?.name);
+}
+
+test "anima keeps the whole llm_adapter high-precision" {
+    // The entire adapter must be unquantized (Forge Neo reroutes it into the
+    // text-encoder MixedPrecision path; a quantized adapter breaks its attention).
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.llm_adapter.embed.weight"));
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.llm_adapter.blocks.0.cross_attn.q_proj.weight"));
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.llm_adapter.out_proj.weight"));
+    // Backbone weights stay quantizable.
+    try std.testing.expect(!anima.isHighPrecision("model.diffusion_model.blocks.5.mlp.layer1.weight"));
+    // Reference (silveroxides) hiprec layers: first block, final layer, embedders.
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.blocks.0.mlp.layer1.weight"));
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.final_layer.linear.weight"));
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.t_embedder.1.linear_1.weight"));
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.x_embedder.proj.1.weight"));
+    // Only block 1's adaln modulation is protected, not the rest of block 1.
+    try std.testing.expect(anima.isHighPrecision("model.diffusion_model.blocks.1.adaln_modulation_mlp.1.weight"));
+    try std.testing.expect(!anima.isHighPrecision("model.diffusion_model.blocks.1.mlp.layer1.weight"));
 }
 
 test "banned key detection with allocator" {
