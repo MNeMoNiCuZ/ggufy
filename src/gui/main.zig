@@ -102,34 +102,38 @@ pub fn main(init: std.process.Init) !void {
         const nstime = win.beginWait(interrupted);
 
         // Batch-load trigger — fires once per new selection/drop, whether it
-        // carries one file or many. Resets the shared arena exactly once for
-        // the whole incoming batch (never per-file), since earlier files'
-        // tensor/arch data would otherwise dangle mid-load.
+        // carries one file or many. New files are ADDED to any already-loaded
+        // input_files (drop/"Open Files" again to load more); only a load into
+        // an empty list resets the shared arena and per-batch conversion state,
+        // since earlier files' tensor/arch data would otherwise dangle mid-load.
+        // Use "Unload all" to explicitly clear the current batch first.
         if (state.pending_ready.load(.acquire)) {
             state.pending_ready.store(false, .release);
             state.load_state.store(.loading, .release);
-            state.clearInputFiles(gpa);
-            _ = arena.reset(.free_all);
-            state.clearBatchResults(gpa);
-            state.clearPairPreviews(gpa);
-            state.clearOverwritePending(gpa);
-            state.convert_options_initialized = false;
-            state.convert_state.store(.idle, .release);
-            state.convert_progress.store(0, .release);
-            state.batch_fatal_error = null;
-            state.sensitivity_path = null;
-            state.template_path = null;
-            state.skip_sensitivity = false;
-            state.allow_unknown_arch = false;
-            state.allow_upscale = false;
-            state.upscale_pending = false;
-            state.arch_override_buf = std.mem.zeroes([64]u8);
-            state.tool_status_len = 0;
-            state.same_file_error = false;
-            state.same_file_error_len = 0;
-            state.prev_pred_signature = null;
-            state.target_folder_buf = std.mem.zeroes([std.fs.max_path_bytes]u8);
-            @memset(&state.target_formats, false);
+            const adding_to_existing = state.input_files.items.len > 0;
+            if (!adding_to_existing) {
+                _ = arena.reset(.free_all);
+                state.clearBatchResults(gpa);
+                state.clearPairPreviews(gpa);
+                state.clearOverwritePending(gpa);
+                state.convert_options_initialized = false;
+                state.convert_state.store(.idle, .release);
+                state.convert_progress.store(0, .release);
+                state.batch_fatal_error = null;
+                state.sensitivity_path = null;
+                state.template_path = null;
+                state.skip_sensitivity = false;
+                state.allow_unknown_arch = false;
+                state.allow_upscale = false;
+                state.upscale_pending = false;
+                state.arch_override_buf = std.mem.zeroes([64]u8);
+                state.tool_status_len = 0;
+                state.same_file_error = false;
+                state.same_file_error_len = 0;
+                state.target_folder_buf = std.mem.zeroes([std.fs.max_path_bytes]u8);
+                @memset(&state.target_formats, false);
+            }
+            state.prev_pred_signature = null; // force preview recompute
             const thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.loadInputBatch, .{ gpa, arena_alloc, &state }) catch |err| {
                 state.load_error = err;
                 state.load_state.store(.err, .release);
@@ -819,31 +823,44 @@ fn showInputFile() void {
 const format_grid_columns = 4;
 
 /// Render one contiguous group of OutputFormats.all_formats (a SafeTensors or
-/// GGUF block) as a checkbox grid with `format_grid_columns` columns. Column
-/// assignment is based on each entry's position within the full catalog group
-/// (not within any filtered subset), so the same format always lands in the
-/// same row/column whether some entries are skipped (main checklist, hidden
-/// entries omitted) or not (settings modal, every entry shown) — that's what
-/// keeps the two views visually aligned.
+/// GGUF block) as a checkbox grid with `format_grid_columns` columns. Only
+/// entries that will actually be rendered (hidden ones excluded) are counted
+/// when dealing out columns, so the columns stay evenly sized regardless of
+/// how many entries in the group are hidden.
 ///
 /// `bound` is indexed by absolute catalog index and holds the checkbox state.
-/// `hidden`, if given, suppresses rendering (but not column placement) for
+/// `hidden`, if given, suppresses rendering entirely (not just visually) for
 /// entries where hidden[i] is true.
 fn showFormatGrid(group_start: usize, group: []const OutputFormats.OutputFormat, bound: *[OutputFormats.all_formats.len]bool, hidden: ?*const [OutputFormats.all_formats.len]bool) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = group_start });
     defer row.deinit();
 
+    var visible_local: [OutputFormats.all_formats.len]usize = undefined;
+    var visible_count: usize = 0;
+    for (0..group.len) |local| {
+        const i = group_start + local;
+        if (hidden) |h| {
+            if (h[i]) continue;
+        }
+        visible_local[visible_count] = local;
+        visible_count += 1;
+    }
+
+    const base = visible_count / format_grid_columns;
+    const extra = visible_count % format_grid_columns; // first `extra` columns get one more entry
+
     var col: usize = 0;
+    var next: usize = 0;
     while (col < format_grid_columns) : (col += 1) {
         var colbox = dvui.box(@src(), .{}, .{ .expand = .horizontal, .id_extra = group_start + col });
         defer colbox.deinit();
 
-        var local: usize = col;
-        while (local < group.len) : (local += format_grid_columns) {
+        const count = base + (if (col < extra) @as(usize, 1) else 0);
+        var n: usize = 0;
+        while (n < count) : (n += 1) {
+            const local = visible_local[next];
+            next += 1;
             const i = group_start + local;
-            if (hidden) |h| {
-                if (h[i]) continue;
-            }
             _ = dvui.checkbox(@src(), &bound[i], group[local].label, .{ .margin = .{ .x = 4, .y = 1, .w = 4, .h = 1 }, .id_extra = i });
         }
     }
