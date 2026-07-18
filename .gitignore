@@ -8,3 +8,5 @@ test-models
 venv
 input/
 output/
+
+venv_activate.bat
