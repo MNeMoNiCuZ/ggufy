@@ -1,3 +1,18 @@
+# Changes in fork
+Added support for multiple inputs and outputs in GUI. For easy batching and multi-output processing.
+<img width="772" height="507" alt="image" src="https://github.com/user-attachments/assets/035d48f6-2871-4dc7-b47f-e3d5263f366f" />
+
+Settings for which output formats to display, cleans up the UI a bit.
+<img width="816" height="628" alt="Image" src="https://github.com/user-attachments/assets/118f1081-34b2-4501-84ec-e99f9823bbce" />
+
+Processing multiple files in sequence.
+<img width="886" height="387" alt="Image" src="https://github.com/user-attachments/assets/fe8998a4-2bbc-45b1-802d-af902b3e2c12" />
+
+
+# Original README
+---
+
+
 # ggufy
 A lightweight and efficient tool to convert tensor formats.
 
