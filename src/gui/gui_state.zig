@@ -1,40 +1,82 @@
 const std = @import("std");
 const ggufy = @import("ggufy");
+const OutputFormats = @import("OutputFormats.zig");
+const SettingsMod = @import("Settings.zig");
 
 pub const LoadState = enum(u8) { idle, loading, done, err };
 pub const ConvertState = enum(u8) { idle, converting, done, err };
 
+const n_formats = OutputFormats.all_formats.len;
+
+/// One selected/loaded input file in the current batch.
+pub const InputFile = struct {
+    /// gpa-owned copy of the path.
+    path: []u8,
+    file: ?ggufy.fileLoader.TensorFile = null,
+    arch_name: ?[]const u8 = null,
+    /// Highest-count entry in the file's type_counts — the "original precision".
+    dominant_type: ?ggufy.types.DataType = null,
+};
+
+/// Result of converting one (input file, output format) pair.
+pub const PairResult = struct {
+    input_path: []const u8, // borrowed from an InputFile still alive in input_files
+    format_label: []const u8, // borrowed from OutputFormats.all_formats (static)
+    output_path: []u8, // gpa-owned
+    err: ?anyerror,
+};
+
+/// A previewed (input file, output format) pair shown before conversion:
+/// generated output filename + predicted size.
+pub const PairPreview = struct {
+    input_path: []const u8, // borrowed from input_files
+    format_label: []const u8, // borrowed from OutputFormats.all_formats
+    output_path: []u8, // gpa-owned
+    predicted_size: ?u64,
+};
+
 pub const State = struct {
     io: std.Io = undefined,
+    /// General-purpose allocator, set once at startup. Needed by SDL callbacks
+    /// (file dialog, drag-drop) that only receive `state` as userdata and must
+    /// allocate owned copies of dropped/selected paths.
+    gpa: std.mem.Allocator = undefined,
 
     // File load
     load_state: std.atomic.Value(LoadState) = .init(.idle),
     dropping: bool = false,
-    file_selected_buf: [std.fs.max_path_bytes]u8 = undefined,
-    file_selected: ?[]u8 = null,
-    file_selected_ready: std.atomic.Value(bool) = .init(false),
     file_dialog_open: bool = false,
     load_error: ?anyerror = null,
-    loaded_file: ?ggufy.fileLoader.TensorFile = null,
     wakeup_event_type: u32 = 0,
 
+    /// Paths collected from the file dialog or a drag-drop batch, staged for
+    /// one atomic load. Set by fileDialogCallback / dropEventWatch, consumed
+    /// by the main loop, which resets the arena exactly once and loads all of
+    /// them before clearing this list. gpa-owned.
+    pending_paths: std.ArrayList([]u8) = .empty,
+    pending_ready: std.atomic.Value(bool) = .init(false),
+
+    /// The currently loaded batch of input files. Selecting/dropping a new
+    /// batch always replaces this list (no incremental add in this version).
+    input_files: std.ArrayList(InputFile) = .empty,
+    /// True when 2+ files in input_files have a detected architecture and
+    /// those architectures don't all match. Hard-blocks conversion.
+    arch_mismatch: bool = false,
+
     // Conversion options
-    /// Set to true after first populating folder/filename buffers from the
-    /// loaded file path so we don't clobber edits the user has already made.
     convert_options_initialized: bool = false,
-    target_filetype: ggufy.types.FileType = .gguf,
-    target_dtype: ?ggufy.types.DataType = null,
+    /// Which catalog entries (by index into OutputFormats.all_formats) are checked.
+    target_formats: [n_formats]bool = std.mem.zeroes([n_formats]bool),
+    /// Which catalog entries are hidden from the checklist (mirrors Settings; edited
+    /// via the format-visibility modal through a temp copy, see settings_temp_hidden).
+    hidden_formats: [n_formats]bool = std.mem.zeroes([n_formats]bool),
+    settings_dialog_open: bool = false,
+    settings_temp_hidden: [n_formats]bool = std.mem.zeroes([n_formats]bool),
+    settings_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    settings_path_len: usize = 0,
+
     /// Output folder — null-terminated; dvui textEntry writes here directly.
     target_folder_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
-    /// Output base filename without extension — null-terminated.
-    target_filename_buf: [256]u8 = std.mem.zeroes([256]u8),
-    /// Base file stem stored at init; used to regenerate filename when dtype changes.
-    filename_base_stem_buf: [256]u8 = std.mem.zeroes([256]u8),
-    filename_base_stem_len: usize = 0,
-    /// Last dtype applied when auto-generating the filename. Null = never auto-applied.
-    prev_target_dtype: ?ggufy.types.DataType = null,
-    /// Length of template_path last time the filename was auto-generated (change detector).
-    prev_template_path_len: usize = 0,
     /// CPU thread count for quantization. Populated at startup with getCpuCount().
     target_threads: usize = 4,
     cpu_count: usize = 4,
@@ -69,21 +111,27 @@ pub const State = struct {
     tool_status_len: usize = 0,
     tool_status_is_error: bool = false,
 
-    // Conversion progress
+    // Conversion progress (batch)
     convert_state: std.atomic.Value(ConvertState) = .init(.idle),
-    /// Index of the last completed tensor.  Written with .release so all
-    /// preceding plain writes (tensor name/type/elements) are visible to the
-    /// main thread after it loads this with .acquire.
+    /// Index of the (file, format) pair currently in flight / last completed.
+    convert_pair_idx: usize = 0,
+    convert_pair_total: usize = 0,
+    /// Index of the last completed tensor within the *current* pair. Written
+    /// with .release so all preceding plain writes (tensor name/type/elements)
+    /// are visible to the main thread after it loads this with .acquire.
     convert_progress: std.atomic.Value(u32) = .init(0),
     convert_total: u32 = 0,
     /// Set true in the GUI to request cancellation; cleared by the convert thread.
     cancel_requested: std.atomic.Value(bool) = .init(false),
     /// Set true in the main loop to spawn the convert thread on the next iteration.
     convert_requested: bool = false,
-    convert_error: ?anyerror = null,
+    /// Fatal error that aborted the whole batch (as opposed to a single pair
+    /// failing, which is recorded per-pair in batch_results and does not stop
+    /// the rest of the batch).
+    batch_fatal_error: ?anyerror = null,
     convert_elapsed_ns: u64 = 0,
-    convert_output_path_buf: [std.fs.max_path_bytes]u8 = undefined,
-    convert_output_path: ?[]u8 = null,
+    /// gpa-owned; freed and rebuilt at the start of each batch run.
+    batch_results: std.ArrayList(PairResult) = .empty,
 
     // Current tensor info — written by the convert thread BEFORE the
     // convert_progress .release store.  The main thread reads these fields
@@ -96,15 +144,19 @@ pub const State = struct {
     convert_tensor_dst_type_len: usize = 0,
     convert_tensor_elements: u64 = 0,
 
-    // Predicted output size (bytes) shown before Convert. Recomputed only when a
-    // size-affecting option changes, tracked via `prev_pred_signature`. Null means
-    // "not yet computed" or "prediction unavailable" (e.g. no data type selected).
-    predicted_size: ?u64 = null,
+    // Predicted per-pair output preview, recomputed only when a size/name-affecting
+    // option changes, tracked via `prev_pred_signature`. gpa-owned; rebuilt in place.
+    pair_previews: std.ArrayList(PairPreview) = .empty,
     prev_pred_signature: ?u64 = null,
 
-    // Overwrite confirmation
-    overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
-    overwrite_pending_path: ?[]u8 = null,
+    // Aggregate overwrite confirmation — all output paths that already exist,
+    // computed once before starting a batch (rather than prompting per pair).
+    overwrite_pending_paths: std.ArrayList([]u8) = .empty,
+
+    // Same-file conflict (an output path would equal one of the input paths)
+    same_file_error: bool = false,
+    same_file_error_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    same_file_error_len: usize = 0,
 
     // Upscale confirmation
     upscale_pending: bool = false,
@@ -112,7 +164,6 @@ pub const State = struct {
 
     // Misc UI state
     show_about: bool = false,
-    same_file_error: bool = false,
 
     // Helpers
     pub fn targetFolder(self: *const State) []const u8 {
@@ -122,10 +173,6 @@ pub const State = struct {
     pub fn archOverride(self: *const State) ?[]const u8 {
         const s = std.mem.sliceTo(&self.arch_override_buf, 0);
         return if (s.len > 0) s else null;
-    }
-
-    pub fn targetFilename(self: *const State) []const u8 {
-        return std.mem.sliceTo(&self.target_filename_buf, 0);
     }
 
     pub fn currentTensorName(self: *const State) []const u8 {
@@ -144,13 +191,48 @@ pub const State = struct {
         return self.tool_status_buf[0..self.tool_status_len];
     }
 
-    /// A hash of every option that affects the predicted output size. When it changes,
-    /// the predicted size is recomputed; otherwise the cached value is reused so the
-    /// (relatively cheap, but non-trivial) prediction doesn't run every frame.
+    pub fn settingsPath(self: *const State) []const u8 {
+        return self.settings_path_buf[0..self.settings_path_len];
+    }
+
+    pub fn sameFileErrorMessage(self: *const State) []const u8 {
+        return self.same_file_error_buf[0..self.same_file_error_len];
+    }
+
+    /// Free everything owned by the current input batch and reset batch-derived
+    /// state. Does NOT touch pending_paths/pending_ready.
+    pub fn clearInputFiles(self: *State, allocator: std.mem.Allocator) void {
+        for (self.input_files.items) |*f| {
+            if (f.file) |*lf| lf.deinit();
+            allocator.free(f.path);
+        }
+        self.input_files.clearRetainingCapacity();
+        self.arch_mismatch = false;
+    }
+
+    pub fn clearBatchResults(self: *State, allocator: std.mem.Allocator) void {
+        for (self.batch_results.items) |r| allocator.free(r.output_path);
+        self.batch_results.clearRetainingCapacity();
+    }
+
+    pub fn clearPairPreviews(self: *State, allocator: std.mem.Allocator) void {
+        for (self.pair_previews.items) |p| allocator.free(p.output_path);
+        self.pair_previews.clearRetainingCapacity();
+    }
+
+    pub fn clearOverwritePending(self: *State, allocator: std.mem.Allocator) void {
+        for (self.overwrite_pending_paths.items) |p| allocator.free(p);
+        self.overwrite_pending_paths.clearRetainingCapacity();
+    }
+
+    /// A hash of every option that affects the predicted per-pair output
+    /// (filenames + sizes). When it changes, previews are recomputed; otherwise
+    /// the cached list is reused so the (relatively cheap, but non-trivial)
+    /// prediction doesn't run every frame.
     pub fn predictionSignature(self: *const State) u64 {
         var h = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&h, self.target_filetype);
-        if (self.target_dtype) |dt| std.hash.autoHash(&h, dt) else std.hash.autoHash(&h, @as(u16, 0xFFFF));
+        for (self.input_files.items) |f| h.update(f.path);
+        for (self.target_formats, 0..) |sel, i| if (sel) std.hash.autoHash(&h, i);
         std.hash.autoHash(&h, self.target_aggressiveness);
         std.hash.autoHash(&h, self.skip_sensitivity);
         std.hash.autoHash(&h, self.model_only);
@@ -159,7 +241,7 @@ pub const State = struct {
         h.update(std.mem.sliceTo(&self.arch_override_buf, 0));
         if (self.template_path) |p| h.update(p);
         if (self.sensitivity_path) |p| h.update(p);
-        if (self.file_selected) |p| h.update(p);
+        h.update(self.targetFolder());
         return h.final();
     }
 };
