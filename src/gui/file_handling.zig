@@ -385,7 +385,6 @@ pub fn rebuildPairPreviews(gpa: std.mem.Allocator, state: *guiState.State) void 
     for (state.input_files.items) |inf| {
         for (OutputFormats.all_formats, 0..) |fmt, i| {
             if (!state.target_formats[i] or state.hidden_formats[i]) continue;
-            if (!state.isFormatAvailable(i, inf.arch_name)) continue;
             _ = pred_arena.reset(.retain_capacity);
             const pa = pred_arena.allocator();
 
@@ -461,7 +460,6 @@ pub fn prepareBatchLaunch(gpa: std.mem.Allocator, state: *guiState.State) void {
             const tf = inf.file orelse continue;
             for (OutputFormats.all_formats, 0..) |fmt, i| {
                 if (!state.target_formats[i] or state.hidden_formats[i]) continue;
-                if (!state.isFormatAvailable(i, inf.arch_name)) continue;
                 if (conv.detectUpscaling(tf.tensors.items, fmt.dtype)) {
                     state.upscale_pending = true;
                     return;
@@ -497,9 +495,9 @@ pub fn convertAll(gpa: std.mem.Allocator, arena_alloc: std.mem.Allocator, state:
 
     var pairs: std.ArrayList(struct { file_idx: usize, fmt_idx: usize }) = .empty;
     defer pairs.deinit(gpa);
-    for (state.input_files.items, 0..) |inf, fi| {
+    for (state.input_files.items, 0..) |_, fi| {
         for (OutputFormats.all_formats, 0..) |_, ti| {
-            if (state.target_formats[ti] and !state.hidden_formats[ti] and state.isFormatAvailable(ti, inf.arch_name)) {
+            if (state.target_formats[ti] and !state.hidden_formats[ti]) {
                 pairs.append(gpa, .{ .file_idx = fi, .fmt_idx = ti }) catch {};
             }
         }

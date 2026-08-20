@@ -850,17 +850,15 @@ fn showFormatGrid(group_start: usize, group: []const OutputFormats.OutputFormat,
         }
 
         const available = state.isFormatAvailable(i, if (state.input_files.items.len > 0) state.input_files.items[0].arch_name else null);
-        if (!available) bound[i] = false;
-        var disabled_value = false;
         var wd: dvui.WidgetData = undefined;
-        _ = dvui.checkbox(@src(), if (available) &bound[i] else &disabled_value, state.outputName(i), .{
+        _ = dvui.checkbox(@src(), &bound[i], state.outputName(i), .{
             .min_size_content = .{ .w = 180 }, .max_size_content = .width(180),
             .margin = .{ .x = 4, .y = 1, .w = 4, .h = 1 }, .id_extra = i,
             .color_text = if (available) null else dvui.themeGet().color(.control, .text).opacity(0.45),
             .data_out = &wd,
         });
         if (!available) dvui.tooltip(@src(), .{ .active_rect = wd.borderRectScale().r },
-            "This format is disabled for the detected architecture. Configure compatibility in File > Formats.", .{}, .{});
+            "This format may be incompatible with the detected architecture, but it can still be selected. Configure compatibility in File > Formats.", .{}, .{});
     }
 }
 
