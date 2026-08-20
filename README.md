@@ -2,7 +2,15 @@
 Added support for multiple inputs and outputs in GUI. For easy batching and multi-output processing.
 <img width="772" height="507" alt="image" src="https://github.com/user-attachments/assets/035d48f6-2871-4dc7-b47f-e3d5263f366f" />
 
-Settings for which output formats to display, cleans up the UI a bit.
+Output format settings support:
+- showing or hiding formats
+- assigning clean output names, such as `FP8` instead of `F8_E4M3`
+- changing display order by dragging rows
+- separate SafeTensors precision and GGUF quantization groups
+- filtering unavailable formats based on the detected model architecture
+- configurable format compatibility for every supported architecture
+
+The Formats settings window follows the main window size and separates format settings from architecture compatibility into tabs.
 <img width="816" height="628" alt="Image" src="https://github.com/user-attachments/assets/118f1081-34b2-4501-84ec-e99f9823bbce" />
 
 Processing multiple files in sequence.
