@@ -11,7 +11,10 @@ Output format settings support:
 - configurable format compatibility for every supported architecture
 
 The Formats settings window follows the main window size and separates format settings from architecture compatibility into tabs.
-<img width="816" height="628" alt="Image" src="https://github.com/user-attachments/assets/118f1081-34b2-4501-84ec-e99f9823bbce" />
+<img width="1367" height="1231" alt="image" src="https://github.com/user-attachments/assets/5b937b4d-58bf-42eb-9377-0606780d84ed" />
+
+The Architecture Compatability settings window lets you choose which formats / precisions are available for each detected architecture.
+<img width="1370" height="701" alt="image" src="https://github.com/user-attachments/assets/9bb032e0-f3e6-4a99-bb70-65986074bb71" />
 
 Processing multiple files in sequence.
 <img width="886" height="387" alt="Image" src="https://github.com/user-attachments/assets/fe8998a4-2bbc-45b1-802d-af902b3e2c12" />
