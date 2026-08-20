@@ -52,6 +52,65 @@ pub fn fileTag(fmt: OutputFormat) []const u8 {
     return @tagName(fmt.dtype);
 }
 
+pub const ArchitectureOption = struct { internal_name: []const u8, display_name: []const u8 };
+
+/// Unique architecture names exposed by ImageArch.arch_list. ltx2 and ltxv
+/// intentionally share the persisted architecture name "ltxv", so they are
+/// represented by one configuration entry here.
+pub const supported_architectures = [_]ArchitectureOption{
+    .{ .internal_name = "flux", .display_name = "Flux" },
+    .{ .internal_name = "sd3", .display_name = "SD3" },
+    .{ .internal_name = "aura", .display_name = "AuraFlow" },
+    .{ .internal_name = "hidream", .display_name = "HiDream" },
+    .{ .internal_name = "anima", .display_name = "Anima" },
+    .{ .internal_name = "cosmos", .display_name = "Cosmos" },
+    .{ .internal_name = "ltxv", .display_name = "LTX Video" },
+    .{ .internal_name = "hyvid", .display_name = "Hunyuan Video" },
+    .{ .internal_name = "wan", .display_name = "Wan" },
+    .{ .internal_name = "sdxl", .display_name = "SDXL" },
+    .{ .internal_name = "sd1", .display_name = "SD1" },
+    .{ .internal_name = "lumina2", .display_name = "ZiT" },
+    .{ .internal_name = "qwen", .display_name = "Qwen Image" },
+    .{ .internal_name = "ernie", .display_name = "ERNIE Image" },
+    .{ .internal_name = "krea2", .display_name = "Krea 2" },
+};
+
+pub const architecture_display_names = blk: {
+    var names: [supported_architectures.len][]const u8 = undefined;
+    for (supported_architectures, 0..) |arch, i| names[i] = arch.display_name;
+    break :blk names;
+};
+
+pub fn architectureIndex(internal_name: []const u8) ?usize {
+    for (supported_architectures, 0..) |arch, i| {
+        if (std.mem.eql(u8, arch.internal_name, internal_name)) return i;
+    }
+    return null;
+}
+
+pub fn architectureDisplayName(internal_name: []const u8) []const u8 {
+    const i = architectureIndex(internal_name) orelse return internal_name;
+    return supported_architectures[i].display_name;
+}
+
+pub fn defaultAvailable(architecture_name: []const u8, fmt: OutputFormat) bool {
+    if (std.mem.eql(u8, architecture_name, "flux")) return fmt.dtype != .MXFP8_E4M3;
+    return true;
+}
+
+comptime {
+    for (ggufy.imageArch.arch_list) |detected| {
+        std.debug.assert(architectureIndex(detected.name) != null);
+    }
+    for (supported_architectures) |configured| {
+        var found = false;
+        for (ggufy.imageArch.arch_list) |detected| {
+            if (std.mem.eql(u8, configured.internal_name, detected.name)) found = true;
+        }
+        std.debug.assert(found);
+    }
+}
+
 /// Index of the first GGUF entry — all_formats is grouped contiguously
 /// (SafeTensors block, then GGUF block), so this is also the SafeTensors
 /// block's length. Used to slice all_formats into its two groups for the

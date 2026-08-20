@@ -70,8 +70,18 @@ pub const State = struct {
     /// Which catalog entries are hidden from the checklist (mirrors Settings; edited
     /// via the format-visibility modal through a temp copy, see settings_temp_hidden).
     hidden_formats: [n_formats]bool = std.mem.zeroes([n_formats]bool),
+    format_order: [n_formats]usize = defaultFormatOrder(),
+    format_output_names: [n_formats][32]u8 = defaultFormatNames(),
+    format_arch_available: [n_formats][OutputFormats.supported_architectures.len]bool = defaultArchitectureAvailability(),
+    architecture_filter_enabled: bool = true,
     settings_dialog_open: bool = false,
     settings_temp_hidden: [n_formats]bool = std.mem.zeroes([n_formats]bool),
+    settings_temp_order: [n_formats]usize = defaultFormatOrder(),
+    settings_temp_output_names: [n_formats][32]u8 = defaultFormatNames(),
+    settings_temp_arch_available: [n_formats][OutputFormats.supported_architectures.len]bool = defaultArchitectureAvailability(),
+    settings_temp_architecture_filter_enabled: bool = true,
+    settings_architecture_index: usize = 0,
+    settings_tab_index: usize = 0,
     settings_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
     settings_path_len: usize = 0,
 
@@ -195,6 +205,17 @@ pub const State = struct {
         return self.settings_path_buf[0..self.settings_path_len];
     }
 
+    pub fn outputName(self: *const State, index: usize) []const u8 {
+        const configured = std.mem.sliceTo(&self.format_output_names[index], 0);
+        return if (configured.len > 0) configured else OutputFormats.fileTag(OutputFormats.all_formats[index]);
+    }
+
+    pub fn isFormatAvailable(self: *const State, index: usize, arch_name: ?[]const u8) bool {
+        if (!self.architecture_filter_enabled) return true;
+        const arch_index = OutputFormats.architectureIndex(arch_name orelse return true) orelse return true;
+        return self.format_arch_available[index][arch_index];
+    }
+
     pub fn sameFileErrorMessage(self: *const State) []const u8 {
         return self.same_file_error_buf[0..self.same_file_error_len];
     }
@@ -233,6 +254,8 @@ pub const State = struct {
         var h = std.hash.Wyhash.init(0);
         for (self.input_files.items) |f| h.update(f.path);
         for (self.target_formats, 0..) |sel, i| if (sel) std.hash.autoHash(&h, i);
+        for (self.format_output_names) |name| h.update(std.mem.sliceTo(&name, 0));
+        std.hash.autoHash(&h, self.architecture_filter_enabled);
         std.hash.autoHash(&h, self.target_aggressiveness);
         std.hash.autoHash(&h, self.skip_sensitivity);
         std.hash.autoHash(&h, self.model_only);
@@ -245,3 +268,29 @@ pub const State = struct {
         return h.final();
     }
 };
+
+fn defaultFormatOrder() [n_formats]usize {
+    var result: [n_formats]usize = undefined;
+    for (0..n_formats) |i| result[i] = i;
+    return result;
+}
+
+fn defaultFormatNames() [n_formats][32]u8 {
+    var result = std.mem.zeroes([n_formats][32]u8);
+    for (OutputFormats.all_formats, 0..) |fmt, i| {
+        const tag = OutputFormats.fileTag(fmt);
+        @memcpy(result[i][0..tag.len], tag);
+    }
+    return result;
+}
+
+fn defaultArchitectureAvailability() [n_formats][OutputFormats.supported_architectures.len]bool {
+    @setEvalBranchQuota(5000);
+    var result: [n_formats][OutputFormats.supported_architectures.len]bool = undefined;
+    for (OutputFormats.all_formats, 0..) |fmt, i| {
+        for (OutputFormats.supported_architectures, 0..) |arch, arch_i| {
+            result[i][arch_i] = OutputFormats.defaultAvailable(arch.internal_name, fmt);
+        }
+    }
+    return result;
+}

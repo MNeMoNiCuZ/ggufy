@@ -385,11 +385,12 @@ pub fn rebuildPairPreviews(gpa: std.mem.Allocator, state: *guiState.State) void 
     for (state.input_files.items) |inf| {
         for (OutputFormats.all_formats, 0..) |fmt, i| {
             if (!state.target_formats[i] or state.hidden_formats[i]) continue;
+            if (!state.isFormatAvailable(i, inf.arch_name)) continue;
             _ = pred_arena.reset(.retain_capacity);
             const pa = pred_arena.allocator();
 
             const stem = std.fs.path.stem(inf.path);
-            const out_name = Renamer.renameForFormat(pa, stem, OutputFormats.fileTag(fmt)) catch continue;
+            const out_name = Renamer.renameForFormat(pa, stem, state.outputName(i)) catch continue;
             const opts = buildConvertOptionsForPair(state, inf.path, fmt, out_name);
             const out_path_tmp = conv.computeOutputPath(opts, pa) catch continue;
             const out_path = gpa.dupe(u8, out_path_tmp) catch continue;
@@ -460,6 +461,7 @@ pub fn prepareBatchLaunch(gpa: std.mem.Allocator, state: *guiState.State) void {
             const tf = inf.file orelse continue;
             for (OutputFormats.all_formats, 0..) |fmt, i| {
                 if (!state.target_formats[i] or state.hidden_formats[i]) continue;
+                if (!state.isFormatAvailable(i, inf.arch_name)) continue;
                 if (conv.detectUpscaling(tf.tensors.items, fmt.dtype)) {
                     state.upscale_pending = true;
                     return;
@@ -495,9 +497,9 @@ pub fn convertAll(gpa: std.mem.Allocator, arena_alloc: std.mem.Allocator, state:
 
     var pairs: std.ArrayList(struct { file_idx: usize, fmt_idx: usize }) = .empty;
     defer pairs.deinit(gpa);
-    for (state.input_files.items, 0..) |_, fi| {
+    for (state.input_files.items, 0..) |inf, fi| {
         for (OutputFormats.all_formats, 0..) |_, ti| {
-            if (state.target_formats[ti] and !state.hidden_formats[ti]) {
+            if (state.target_formats[ti] and !state.hidden_formats[ti] and state.isFormatAvailable(ti, inf.arch_name)) {
                 pairs.append(gpa, .{ .file_idx = fi, .fmt_idx = ti }) catch {};
             }
         }
@@ -528,7 +530,7 @@ pub fn convertAll(gpa: std.mem.Allocator, arena_alloc: std.mem.Allocator, state:
         const fmt = OutputFormats.all_formats[pair.fmt_idx];
 
         const stem = std.fs.path.stem(inf.path);
-        const out_name = Renamer.renameForFormat(ca, stem, OutputFormats.fileTag(fmt)) catch |err| {
+        const out_name = Renamer.renameForFormat(ca, stem, state.outputName(pair.fmt_idx)) catch |err| {
             recordPairResult(gpa, state, inf.path, fmt.label, inf.path, err);
             continue;
         };

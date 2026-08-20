@@ -63,6 +63,20 @@ pub fn main(init: std.process.Init) !void {
             for (settings.hidden_formats) |label| {
                 if (OutputFormats.indexOfLabel(label)) |idx| state.hidden_formats[idx] = true;
             }
+            state.architecture_filter_enabled = settings.architecture_filter_enabled;
+            for (settings.formats) |f| {
+                const idx = OutputFormats.indexOfLabel(f.key) orelse continue;
+                if (f.output_name.len > 0) {
+                    const name_len = @min(f.output_name.len, state.format_output_names[idx].len - 1);
+                    @memset(&state.format_output_names[idx], 0);
+                    @memcpy(state.format_output_names[idx][0..name_len], f.output_name[0..name_len]);
+                }
+                if (f.order < OutputFormats.all_formats.len) state.format_order[f.order] = idx;
+                @memset(&state.format_arch_available[idx], true);
+                for (f.unavailable_architectures) |arch_name| {
+                    if (OutputFormats.architectureIndex(arch_name)) |arch_i| state.format_arch_available[idx][arch_i] = false;
+                }
+            }
         }
     }
 
@@ -225,6 +239,10 @@ fn gui_frame() bool {
 
             if (dvui.menuItemLabel(@src(), "Formats...", .{}, .{ .expand = .horizontal }) != null) {
                 @memcpy(&state.settings_temp_hidden, &state.hidden_formats);
+                @memcpy(&state.settings_temp_order, &state.format_order);
+                @memcpy(&state.settings_temp_output_names, &state.format_output_names);
+                @memcpy(&state.settings_temp_arch_available, &state.format_arch_available);
+                state.settings_temp_architecture_filter_enabled = state.architecture_filter_enabled;
                 state.settings_dialog_open = true;
             }
 
@@ -406,7 +424,7 @@ fn showInputFile() void {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 0 }, .id_extra = i });
             defer row.deinit();
 
-            const arch_name = inf.arch_name orelse "unknown";
+            const arch_name = if (inf.arch_name) |name| OutputFormats.architectureDisplayName(name) else "Unknown";
             const orig_type: []const u8 = if (inf.dominant_type) |dt| @tagName(dt) else "?";
             var size_buf: [16]u8 = undefined;
             const size_str = if (inf.file) |f| formatBytes(f.sizeInBytes, &size_buf) else "?";
@@ -442,15 +460,11 @@ fn showInputFile() void {
         var opts_box = dvui.box(@src(), .{}, .{ .expand = .horizontal, .margin = .{ .x = 4, .y = 8, .w = 4, .h = 4 } });
         defer opts_box.deinit();
 
-        // Combined output-format checklist — SafeTensors formats first, GGUF last,
-        // laid out in 4 columns (same column layout as the Formats settings modal,
-        // so a format sits in the same visual slot in both places).
+        // Combined output-format checklist in the user's configured order.
         {
             dvui.label(@src(), "Output formats", .{}, .{ .font = .theme(.title), .margin = .{ .x = 0, .y = 4, .w = 0, .h = 4 } });
-
-            dvui.label(@src(), "SafeTensors formats", .{}, .{ .color_text = dim_color, .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 } });
+            dvui.label(@src(), "SafeTensors formats", .{}, .{ .color_text = dim_color, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 } });
             showFormatGrid(0, OutputFormats.all_formats[0..OutputFormats.gguf_start_index], &state.target_formats, &state.hidden_formats);
-
             dvui.label(@src(), "GGUF formats", .{}, .{ .color_text = dim_color, .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 } });
             showFormatGrid(OutputFormats.gguf_start_index, OutputFormats.all_formats[OutputFormats.gguf_start_index..], &state.target_formats, &state.hidden_formats);
         }
@@ -820,49 +834,33 @@ fn showInputFile() void {
     }
 }
 
-const format_grid_columns = 4;
-
-/// Render one contiguous group of OutputFormats.all_formats (a SafeTensors or
-/// GGUF block) as a checkbox grid with `format_grid_columns` columns. Only
-/// entries that will actually be rendered (hidden ones excluded) are counted
-/// when dealing out columns, so the columns stay evenly sized regardless of
-/// how many entries in the group are hidden.
+/// Render one contiguous format group in display order.
 ///
 /// `bound` is indexed by absolute catalog index and holds the checkbox state.
 /// `hidden`, if given, suppresses rendering entirely (not just visually) for
 /// entries where hidden[i] is true.
 fn showFormatGrid(group_start: usize, group: []const OutputFormats.OutputFormat, bound: *[OutputFormats.all_formats.len]bool, hidden: ?*const [OutputFormats.all_formats.len]bool) void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = group_start });
-    defer row.deinit();
+    var formats = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .id_extra = group_start });
+    defer formats.deinit();
 
-    var visible_local: [OutputFormats.all_formats.len]usize = undefined;
-    var visible_count: usize = 0;
-    for (0..group.len) |local| {
-        const i = group_start + local;
+    for (state.format_order) |i| {
+        if (i < group_start or i >= group_start + group.len) continue;
         if (hidden) |h| {
             if (h[i]) continue;
         }
-        visible_local[visible_count] = local;
-        visible_count += 1;
-    }
 
-    const base = visible_count / format_grid_columns;
-    const extra = visible_count % format_grid_columns; // first `extra` columns get one more entry
-
-    var col: usize = 0;
-    var next: usize = 0;
-    while (col < format_grid_columns) : (col += 1) {
-        var colbox = dvui.box(@src(), .{}, .{ .expand = .horizontal, .id_extra = group_start + col });
-        defer colbox.deinit();
-
-        const count = base + (if (col < extra) @as(usize, 1) else 0);
-        var n: usize = 0;
-        while (n < count) : (n += 1) {
-            const local = visible_local[next];
-            next += 1;
-            const i = group_start + local;
-            _ = dvui.checkbox(@src(), &bound[i], group[local].label, .{ .margin = .{ .x = 4, .y = 1, .w = 4, .h = 1 }, .id_extra = i });
-        }
+        const available = state.isFormatAvailable(i, if (state.input_files.items.len > 0) state.input_files.items[0].arch_name else null);
+        if (!available) bound[i] = false;
+        var disabled_value = false;
+        var wd: dvui.WidgetData = undefined;
+        _ = dvui.checkbox(@src(), if (available) &bound[i] else &disabled_value, state.outputName(i), .{
+            .min_size_content = .{ .w = 180 }, .max_size_content = .width(180),
+            .margin = .{ .x = 4, .y = 1, .w = 4, .h = 1 }, .id_extra = i,
+            .color_text = if (available) null else dvui.themeGet().color(.control, .text).opacity(0.45),
+            .data_out = &wd,
+        });
+        if (!available) dvui.tooltip(@src(), .{ .active_rect = wd.borderRectScale().r },
+            "This format is disabled for the detected architecture. Configure compatibility in File > Formats.", .{}, .{});
     }
 }
 
@@ -1137,6 +1135,10 @@ fn showAboutModal() void {
 
 fn saveFormatSettings() void {
     @memcpy(&state.hidden_formats, &state.settings_temp_hidden);
+    @memcpy(&state.format_order, &state.settings_temp_order);
+    @memcpy(&state.format_output_names, &state.settings_temp_output_names);
+    @memcpy(&state.format_arch_available, &state.settings_temp_arch_available);
+    state.architecture_filter_enabled = state.settings_temp_architecture_filter_enabled;
     state.settings_dialog_open = false;
     state.prev_pred_signature = null; // force preview recompute against new visibility
 
@@ -1145,14 +1147,83 @@ fn saveFormatSettings() void {
     for (OutputFormats.all_formats, 0..) |fmt, i| {
         if (state.hidden_formats[i]) labels.append(fa, fmt.label) catch {};
     }
-    SettingsMod.save(state.io, gpa, state.settingsPath(), labels.items) catch |err| {
+    var formats: std.ArrayList(SettingsMod.JsonFormatSetting) = .empty;
+    for (state.format_order, 0..) |idx, order| {
+        var unavailable: std.ArrayList([]const u8) = .empty;
+        for (OutputFormats.supported_architectures, 0..) |arch, arch_i| {
+            if (!state.format_arch_available[idx][arch_i]) unavailable.append(fa, arch.internal_name) catch {};
+        }
+        formats.append(fa, .{
+            .key = OutputFormats.all_formats[idx].label,
+            .output_name = state.outputName(idx),
+            .order = order,
+            .unavailable_architectures = unavailable.items,
+        }) catch {};
+    }
+    SettingsMod.save(state.io, gpa, state.settingsPath(), labels.items, formats.items, state.architecture_filter_enabled) catch |err| {
         std.log.err("Failed to save settings: {}", .{err});
     };
 }
 
+fn moveFormatOrder(order: *[OutputFormats.all_formats.len]usize, from: usize, before: usize) void {
+    if (from >= order.len or before > order.len or from == before or from + 1 == before) return;
+    const moved = order[from];
+    if (from < before) {
+        var i = from;
+        while (i + 1 < before) : (i += 1) order[i] = order[i + 1];
+        order[before - 1] = moved;
+    } else {
+        var i = from;
+        while (i > before) : (i -= 1) order[i] = order[i - 1];
+        order[before] = moved;
+    }
+}
+
+fn showArchitectureFormatGrid(architecture_index: usize) void {
+    const hint_color = dvui.themeGet().color(.control, .text).opacity(0.6);
+
+    dvui.label(@src(), "SafeTensors formats", .{}, .{ .color_text = hint_color, .margin = .{ .x = 3, .y = 2, .w = 3, .h = 2 } });
+    showArchitectureFormatGroup(architecture_index, .safetensors);
+    dvui.label(@src(), "GGUF formats", .{}, .{ .color_text = hint_color, .margin = .{ .x = 3, .y = 8, .w = 3, .h = 2 } });
+    showArchitectureFormatGroup(architecture_index, .gguf);
+}
+
+fn showArchitectureFormatGroup(architecture_index: usize, filetype: ggufy.types.FileType) void {
+    const group_id: usize = @intFromEnum(filetype);
+    var outer = dvui.box(@src(), .{}, .{ .expand = .horizontal, .border = dvui.Rect.all(1), .padding = .all(4), .id_extra = group_id });
+    defer outer.deinit();
+
+    var formats = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .id_extra = group_id });
+    defer formats.deinit();
+
+    for (state.settings_temp_order) |format_i| {
+        if (OutputFormats.all_formats[format_i].filetype != filetype) continue;
+        const configured_name = std.mem.sliceTo(&state.settings_temp_output_names[format_i], 0);
+        const clean_name = if (configured_name.len > 0) configured_name else OutputFormats.fileTag(OutputFormats.all_formats[format_i]);
+        _ = dvui.checkbox(@src(), &state.settings_temp_arch_available[format_i][architecture_index], clean_name, .{
+            .min_size_content = .{ .w = 180 }, .max_size_content = .width(180),
+            .id_extra = format_i, .margin = .{ .x = 3, .y = 1, .w = 3, .h = 1 },
+        });
+    }
+}
+
+fn setArchitectureFormats(architecture_index: usize, filetype: ?ggufy.types.FileType, selected: bool) void {
+    for (OutputFormats.all_formats, 0..) |format, format_i| {
+        if (filetype == null or format.filetype == filetype.?) {
+            state.settings_temp_arch_available[format_i][architecture_index] = selected;
+        }
+    }
+}
+
 fn showFormatSettingsModal() void {
-    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 480, .h = 460 } });
+    const window_rect = dvui.windowRect();
+    const modal_w = @max(@as(f32, 560), window_rect.w - 64);
+    const modal_h = @max(@as(f32, 580), window_rect.h - 64);
+
+    var modal_rect: dvui.Rect = .{ .x = 32, .y = 32, .w = modal_w, .h = modal_h };
+    var float = dvui.floatingWindow(@src(), .{ .modal = true, .resize = .none, .rect = &modal_rect }, .{});
     defer float.deinit();
+    float.dragAreaSet(.{});
 
     // ESC or a click outside the dialog closes it (discarding changes, same as Cancel).
     const win_rect = float.data().rectScale().r;
@@ -1179,37 +1250,119 @@ fn showFormatSettingsModal() void {
 
     const hint_color = dvui.themeGet().color(.control, .text).opacity(0.6);
 
-    dvui.label(@src(), "Visible formats", .{}, .{ .font = .theme(.title), .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
-    dvui.label(@src(), "Uncheck a format to hide it from the output list.", .{}, .{ .color_text = hint_color, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 8 } });
-
-    var visible: [OutputFormats.all_formats.len]bool = undefined;
-    for (0..visible.len) |i| visible[i] = !state.settings_temp_hidden[i];
-
     {
-        var s = dvui.scrollArea(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = 300 }, .max_size_content = .height(300) });
-        defer s.deinit();
-
-        dvui.label(@src(), "SafeTensors formats", .{}, .{ .color_text = hint_color, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 } });
-        showFormatGrid(0, OutputFormats.all_formats[0..OutputFormats.gguf_start_index], &visible, null);
-
-        dvui.label(@src(), "GGUF formats", .{}, .{ .color_text = hint_color, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } });
-        showFormatGrid(OutputFormats.gguf_start_index, OutputFormats.all_formats[OutputFormats.gguf_start_index..], &visible, null);
-    }
-
-    for (0..visible.len) |i| state.settings_temp_hidden[i] = !visible[i];
-
-    {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_x = 1.0, .margin = .{ .x = 0, .y = 12, .w = 0, .h = 0 } });
-        defer row.deinit();
-
-        if (dvui.button(@src(), "Close", .{}, .{ .margin = .all(4) })) {
+        var title_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
+        defer title_row.deinit();
+        dvui.label(@src(), "Output formats", .{}, .{ .font = .theme(.title), .expand = .horizontal, .gravity_y = 0.5 });
+        if (dvui.button(@src(), "Close", .{}, .{ .margin = .{ .x = 4, .y = 0, .w = 4, .h = 0 }, .gravity_y = 0.5 })) {
             state.settings_dialog_open = false;
         }
-
-        if (dvui.button(@src(), "Save", .{}, .{ .margin = .all(4) })) {
-            saveFormatSettings();
-        }
+        if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5 })) saveFormatSettings();
     }
+    if (!state.settings_dialog_open) return;
+    {
+        var tabs = dvui.tabs(@src(), .{}, .{ .expand = .horizontal });
+        defer tabs.deinit();
+        if (tabs.addTabLabel(state.settings_tab_index == 0, "Formats", .{})) state.settings_tab_index = 0;
+        if (tabs.addTabLabel(state.settings_tab_index == 1, "Architecture Compatibility", .{})) state.settings_tab_index = 1;
+    }
+
+    if (state.settings_tab_index == 0) {
+        dvui.label(@src(), "Set visibility, clean name, and display order.", .{}, .{ .color_text = hint_color, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 8 } });
+        var s = dvui.scrollArea(@src(), .{}, .{
+            .expand = .both, .min_size_content = .{ .h = 180 },
+        });
+        defer s.deinit();
+
+        {
+            var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                .expand = .horizontal, .border = dvui.Rect.all(1), .padding = .{ .x = 3, .y = 2, .w = 3, .h = 2 },
+                .color_border = hint_color,
+            });
+            defer header.deinit();
+            dvui.label(@src(), "Drag", .{}, .{ .min_size_content = .{ .w = 42 }, .color_text = hint_color });
+            dvui.label(@src(), "Show", .{}, .{ .min_size_content = .{ .w = 48 }, .color_text = hint_color });
+            dvui.label(@src(), "Format", .{}, .{ .min_size_content = .{ .w = 220 }, .color_text = hint_color });
+            dvui.label(@src(), "Clean name", .{}, .{ .expand = .horizontal, .color_text = hint_color });
+        }
+
+        var reorder: dvui.ReorderWidget = undefined;
+        reorder.init(@src(), .{}, .{ .expand = .horizontal });
+        defer reorder.deinit();
+        var format_rows = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+        defer format_rows.deinit();
+        var removed_order: ?usize = null;
+        var insert_before_order: ?usize = null;
+
+        for (state.settings_temp_order, 0..) |idx, order| {
+            var reorderable: dvui.Reorderable = undefined;
+            reorderable.init(@src(), &reorder, .{ .reorder_id = idx }, .{ .id_extra = idx, .expand = .horizontal });
+            defer reorderable.deinit();
+            reorderable.install();
+            if (reorderable.removed()) removed_order = order;
+            if (reorderable.insertBefore()) insert_before_order = order;
+
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                .expand = .horizontal, .id_extra = idx,
+                .border = dvui.Rect.all(1), .padding = .{ .x = 3, .y = 1, .w = 3, .h = 1 },
+                .color_border = hint_color,
+                .background = reorderable.floating(),
+                .color_fill = if (reorderable.floating()) dvui.themeGet().focus.opacity(0.18) else null,
+            });
+            defer row.deinit();
+            if (dvui.ReorderWidget.draggable(@src(), .{ .rect = reorderable.data().rectScale().r }, .{
+                .min_size_content = .{ .w = 36, .h = 22 }, .max_size_content = .width(36), .gravity_y = 0.5, .id_extra = idx,
+            })) |drag_point| reorder.dragStart(idx, drag_point, 0);
+            var visible = !state.settings_temp_hidden[idx];
+            _ = dvui.checkbox(@src(), &visible, null, .{ .min_size_content = .{ .w = 48 }, .gravity_y = 0.5, .id_extra = idx });
+            state.settings_temp_hidden[idx] = !visible;
+            dvui.labelNoFmt(@src(), OutputFormats.all_formats[idx].label, .{}, .{ .min_size_content = .{ .w = 220 }, .gravity_y = 0.5 });
+            var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &state.settings_temp_output_names[idx] } }, .{
+                .expand = .horizontal, .min_size_content = .{ .w = 180, .h = dvui.themeGet().font_body.lineHeight() },
+                .margin = .{ .x = 4, .y = 0, .w = 4, .h = 0 }, .padding = .{ .x = 6, .y = 3, .w = 6, .h = 3 },
+                .gravity_y = 0.5, .id_extra = idx,
+            });
+            te.deinit();
+        }
+
+        if (reorder.needFinalSlot()) {
+            var final_slot = reorder.reorderable(@src(), .{ .last_slot = true }, .{});
+            defer final_slot.deinit();
+            if (final_slot.insertBefore()) insert_before_order = state.settings_temp_order.len;
+        }
+
+        if (removed_order) |from| {
+            if (insert_before_order) |before| moveFormatOrder(&state.settings_temp_order, from, before);
+        }
+    } else {
+    dvui.label(@src(), "Architecture compatibility", .{}, .{ .font = .theme(.heading), .margin = .{ .x = 0, .y = 12, .w = 0, .h = 4 } });
+    _ = dvui.checkbox(@src(), &state.settings_temp_architecture_filter_enabled, "Filter formats by detected architecture", .{ .margin = .{ .x = 0, .y = 0, .w = 0, .h = 6 } });
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Architecture", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 100 } });
+        _ = dvui.dropdown(@src(), &OutputFormats.architecture_display_names, .{ .choice = &state.settings_architecture_index }, .{}, .{ .min_size_content = .{ .w = 200 }, .gravity_y = 0.5 });
+    }
+    {
+        const arch_i = state.settings_architecture_index;
+        var buttons = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 6 } });
+        defer buttons.deinit();
+        if (dvui.button(@src(), "Select All", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 4, .h = 4 } })) setArchitectureFormats(arch_i, null, true);
+        if (dvui.button(@src(), "Select None", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 4, .h = 4 } })) setArchitectureFormats(arch_i, null, false);
+        if (dvui.button(@src(), "Select All Precisions", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 4, .h = 4 } })) setArchitectureFormats(arch_i, .safetensors, true);
+        if (dvui.button(@src(), "Select No Precisions", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 4, .h = 4 } })) setArchitectureFormats(arch_i, .safetensors, false);
+        if (dvui.button(@src(), "Select All Quants", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 4, .h = 4 } })) setArchitectureFormats(arch_i, .gguf, true);
+        if (dvui.button(@src(), "Select No Quants", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } })) setArchitectureFormats(arch_i, .gguf, false);
+    }
+    {
+        var compatibility_scroll = dvui.scrollArea(@src(), .{}, .{
+            .expand = .horizontal,
+        });
+        defer compatibility_scroll.deinit();
+        showArchitectureFormatGrid(state.settings_architecture_index);
+    }
+    }
+
 }
 
 // Model internals tree (first file in the batch)
